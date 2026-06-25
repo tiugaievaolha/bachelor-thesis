@@ -1,0 +1,2697 @@
+---
+title: "When Does an Amenity Become a Nuisance?"
+subtitle: "Identifying the Demographic Tipping Point Where School Proximity Shifts from a Price Premium to a Price Discount in Dutch Neighbourhoods"
+author: "Olha Tiugaieva - 0117218"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE, # prints the code in the output
+  warning = FALSE, # suppresses noisy package messages
+  message = FALSE, # suppresses noisy package messages
+  fig.width  = 9, # sets the default size and resolution of every plot
+  fig.height = 5.5,
+  dpi     = 150
+)
+```
+
+---
+
+# Setup
+
+This section loads all packages required for the full analysis pipeline and sets global options. Running this chunk first ensures a clean, reproducible environment — any missing packages are installed automatically so the script runs on any machine without manual preparation.
+
+The pipeline draws on four groups of packages: data access (`cbsodataR`, `httr`, `jsonlite`, `readxl`), data wrangling (`dplyr`, `tidyr`, `stringr`, `janitor`), spatial analysis (`sf`, `nngeo`, `units`), econometric estimation (`fixest`, `lmtest`, `sandwich`, `spdep`), visualisation (`ggplot2` and companions), and output formatting (`modelsummary`, `stargazer`).
+
+```{r packages}
+required_packages <- c(
+  "cbsodataR", # Data access
+  "httr",
+  "jsonlite",
+  "readxl",
+  "dplyr", # Data wrangling
+  "tidyr",
+  "stringr",
+  "janitor",
+  "sf", # Spatial
+  "nngeo",
+  "units",
+  "fixest", # Fast FE estimation + clustered SEs
+  "lmtest", # Modelling (used in later sections)
+  "sandwich",
+  "spdep",
+  "spatialreg",
+  "splines",
+  "ggplot2", # Visualization
+  "ggeffects",
+  "scales",
+  "viridis",
+  "patchwork",
+  "stargazer", # Output
+  "modelsummary",
+  "kableExtra",
+  "webshot2"
+)
+
+new_pkgs <- required_packages[!(required_packages %in% installed.packages()[, "Package"])] # Finding the packages that are missing (not yet installed on the machine)
+if (length(new_pkgs) > 0) {
+  install.packages(new_pkgs, repos = "https://cloud.r-project.org") # Installing only what is missing
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE)) # Loops over every package in required_packages and calls library() on each one to load it into the R session (character.only = TRUE is needed because library() normally expects you to type a name directly, but here it is a vector). invisible() stops R from printing the package load confirmations.
+```
+
+```{r global-settings}
+set.seed(42) # makes any random operations reproducible
+options(scipen = 999) # To avoid scientific notation (1234567 instead of 1.23e+06)
+
+theme_set( # Sets a default visual style that will apply to every ggplot2 chart
+  theme_bw(base_size = 12) + # Clean black-and-white base theme with 12pt font
+    theme(
+      panel.grid.minor = element_blank(), # Removes the faint minor grid lines
+      plot.title       = element_text(face = "bold", size = 13), # Makes titles bold and slightly larger than the base
+      plot.subtitle    = element_text(colour = "grey40"), # Colours subtitles grey
+      axis.title       = element_text(size = 11) # Sets axis label size
+    )
+)
+
+# Create output directories
+for (d in c("data/raw", "data/processed", "output/figures", "output/tables")) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+} # Creates four folders on your computer if they don't already exist; recursive = T ensures the rest of the script has somewhere to save files without crashing when it tries to write to a folder that doesn't exist yet
+```
+
+---
+
+# CBS Data: Download and Clean
+
+## Downloading the CBS Kerncijfers
+
+The primary data source is the *Kerncijfers Wijken en Buurten* published annually by Statistics Netherlands (CBS). Each edition covers all Dutch wijken (districts) and provides harmonised variables on housing valuations, household composition, income, employment, school infrastructure, and car ownership. We download eight annual editions (2016–2023) via the CBS Open Data API using the `cbsodataR` package and stack them into a balanced panel.
+
+A few practical notes on the download function `download_kwb()`:
+
+- **Caching:** each year is saved as a local RDS file after the first download. On subsequent runs the function loads from cache rather than re-downloading, which saves time and reduces API load. To force a fresh download, delete the relevant `data/raw/cbs_YYYY_raw.rds` file.
+- **Column name harmonisation:** CBS occasionally renames variables across editions (e.g. the school distance variable is `AfstandTotSchool_` in some years and `AfstandTotBasisschool_` in others; income uses two different column names). The `grab()` helper function resolves this by matching on regex patterns rather than exact names.
+- **Missing value codes:** CBS encodes suppressed values (suppressed for privacy when a district is too small) as −99997, −99998, or −99999. These are recoded to `NA`.
+- **Car ownership:** `PersonenautoSPerHuishouden_` gives the average number of registered passenger cars per household in the wijk — added as part of the car ownership extension.
+
+```{r cbs-download, cache=FALSE} 
+# cashing is disabled
+# ── CBS table IDs per year (Kerncijfers Wijken en Buurten) ──────────────────
+cbs_table_ids <- c( # creates a named vector (year paired with a CBS API)
+  "2016" = "83487NED",
+  "2017" = "83765NED",
+  "2018" = "84286NED",
+  "2019" = "84583NED",
+  "2020" = "84799NED",
+  "2021" = "85039NED",
+  "2022" = "85318NED",
+  "2023" = "85618NED"
+)
+
+MISSING_CODES <- c(-99997, -99998, -99999) # CBS uses these specific numbers to represent suppressed or missing data
+PANEL_RDS     <- "data/raw/cbs_panel_raw.rds" # stores the file path for the combined panel as a variable; used later to check if the panel already exists and to save it
+
+# ── Helper: download and standardise one year ───────────────────────────────
+download_kwb <- function(yr, table_id) { # Function definition; takes two inputs: yr (a year like "2018") and table_id (the CBS code like "84286NED")
+  yr_rds <- paste0("data/raw/cbs_", yr, "_raw.rds")
+  if (file.exists(yr_rds)) { # If the cache file for this year already exists on disk, load it and immediately return it; return() exits the function early with the cached data
+    message("  ", yr, ": loaded from cache.")
+    return(readRDS(yr_rds))
+  }
+  message("  ", yr, ": downloading (", table_id, ") ...") # If no cache found, "downloading" and call cbs-get-data() from the cbsodataR 
+  raw <- cbs_get_data(table_id) |>
+    mutate(across(where(is.character), str_trim)) |> # Applies str_trim() to every character column (removes any leading or trailing spaces from text values)
+    filter(str_starts(WijkenEnBuurten, "WK")) |> # Keeps only districts (wijken)
+    mutate(across(where(is.numeric), ~ ifelse(. %in% MISSING_CODES, NA, .))) # Replace missing codes with NA
+  nms <- names(raw) # Store column names
+
+  # Grab first column matching pattern; return NA vector if absent
+  grab <- function(pat) {
+    col <- grep(pat, nms, value = TRUE)[1]
+    if (is.na(col)) rep(NA_real_, nrow(raw)) else raw[[col]]
+  }
+
+  # Column names that differ across years
+  dist_col   <- if (any(grepl("^AfstandTotSchool_", nms))) "^AfstandTotSchool_"
+                else "^AfstandTotBasisschool_" # Check which version exists in the current year's data, if at least one column matches, returns TRUE
+  income_col <- if (any(grepl("^GemGestandaardiseerdInkomenVanHuish_", nms)))
+                  "^GemGestandaardiseerdInkomenVanHuish_"
+                else "^GemiddeldGestandaardiseerdInkomenVanHuishoudens_"
+  pct_single_direct <- any(grepl("^PercentageEenpersoonshuishoudens_", nms)) # Checks whether CBS directly provides the percentage of single-person households in this year
+
+  hh_total  <- grab("^HuishoudensTotaal_") # Pre-fetch household count columns
+  hh_single <- grab("^Eenpersoonshuishoudens_")
+
+  out <- tibble( # Build the output tibble (one raw per district)
+    year                = as.integer(yr), # "2018" to 2018 (string to number)
+    wijk_code           = raw$WijkenEnBuurten,
+    gemeente_code       = paste0("GM", str_sub(raw$WijkenEnBuurten, 3, 6)), # Extracts the municipality code from the district code. Wijk codes look like "WK034401", where characters 3–6 ("0344") are the municipality number; prepending "GM" gives the standard CBS municipality code "GM0344"
+    woz_avg_k           = grab("^GemiddeldeWOZWaardeVanWoningen_"), # Other columns call grab() with the appropriate pattern to retrieve that CBS variable
+    dist_primary_school = grab(dist_col),
+    n_schools_3km       = grab("^ScholenBinnen3Km_"),
+    hh_total            = hh_total,
+    hh_single           = hh_single,
+    hh_no_children      = grab("^HuishoudensZonderKinderen_"),
+    hh_with_children    = grab("^HuishoudensMetKinderen_"),
+    koopwoningen        = grab("^Koopwoningen_"),
+    woningvoorraad      = grab("^Woningvoorraad_"),
+    income_avg_k        = grab(income_col),
+    pct_low_income      = grab("^HuishoudensMetEenLaagInkomen_"),
+    pct_employed        = grab("^Nettoarbeidsparticipatie_"),
+    pop_total           = grab("^AantalInwoners_"),
+    pop_density_km2     = grab("^Omgevingsadressendichtheid_"),
+    n_age_0_14          = grab("^k_0Tot15Jaar_"),
+    cars_per_hh         = grab("^PersonenautoSPerHuishouden_")
+  ) |>
+  mutate( # Adds derived percentage columns
+    pct_single_hh        = if (pct_single_direct) # If CBS provides the singles percentage directly (pct_single_direct = TRUE), use it
+                             grab("^PercentageEenpersoonshuishoudens_")
+                           else 100 * hh_single / hh_total, # If no, compute it
+    pct_hh_no_children   = 100 * hh_no_children  / hh_total,
+    pct_hh_with_children = 100 * hh_with_children / hh_total,
+    pct_owner_occupied   = koopwoningen, # Just renamed
+    pct_age_0_14         = 100 * n_age_0_14 / pop_total
+  )
+
+  saveRDS(out, yr_rds) # Save to cache and return
+  out
+}
+
+# ── Download all years and stack into panel ─────────────────────────────────
+if (file.exists(PANEL_RDS)) { # Check if full panel already cached
+  cbs_panel <- readRDS(PANEL_RDS)
+  message("Panel loaded from cache: ", nrow(cbs_panel), " rows")
+} else {
+  cbs_panel <- bind_rows(mapply(download_kwb, # If no cached panel exists, download all years and stack; mapply is like a loop — it calls download_kwb(yr="2016", table_id="83487NED"), then download_kwb(yr="2017", table_id="83765NED"), and so on
+                                yr       = names(cbs_table_ids),
+                                table_id = cbs_table_ids,
+                                SIMPLIFY = FALSE)) # tells mapply to return a list of tibbles rather than trying to combine them into a matrix, bind_rows() then stacks all those tibbles into one tall panel
+  saveRDS(cbs_panel, PANEL_RDS) # Save the full panel
+  message("Panel built and cached: ", nrow(cbs_panel), " rows")
+}
+
+# 2023 cross-section kept as cbs_clean for EDA chunks below
+cbs_clean <- cbs_panel %>% filter(year == 2023)
+cat("Panel years:", paste(sort(unique(cbs_panel$year)), collapse = ", "), "\n") # Final diagnostics 
+cat("Wijken (2023):", nrow(cbs_clean), "\n")
+```
+
+The output should confirm eight panel years (2016–2023) and approximately 3,350 wijken in the 2023 cross-section. The exact count varies slightly because CBS occasionally adds or merges wijken between editions.
+
+## Data Overview
+
+A quick `glimpse()` of the 2023 cross-section confirms column names, data types, and rough value ranges. This is a sanity check, we want to verify that numeric columns parsed correctly (no character columns where numbers are expected), that the CBS missing codes were recoded to `NA`, and that `cars_per_hh` is present with plausible values (roughly 0.8–1.8 for Dutch wijken).
+
+```{r cbs-overview}
+glimpse(cbs_clean) # Prints column names, data types, and a sample of values for the 2023 cross-section. The purpose is to visually confirm that numeric columns parsed correctly and that cars_per_hh is present
+```
+
+## Cleaning and Derived Variables
+
+Several derived variables are added to the panel before any analysis. The most important are:
+
+- **`log_woz`**: the natural log of average WOZ value (in euros, not thousands). The log transformation is standard in the hedonic pricing literature — it yields coefficients interpretable as percentage changes and compresses the right-skewed house price distribution.
+- **`delta_singles_lag1`**: the one-year lagged change in single-person household share (Singlesᵢ,ₜ₋₁ − Singlesᵢ,ₜ₋₂). This is included in the panel models to control for prior demographic momentum — districts that were already gaining singles may have experienced anticipatory house price movements.
+- **`gemeente_fe`**: a factor version of the municipality code, used as the fixed effect variable in cross-sectional models.
+
+Note that `delta_singles_lag1` requires two prior years of data per wijk, so it is unavailable for 2016 and 2017 observations, those rows receive `NA` and are excluded from the panel models.
+
+```{r cbs-clean}
+# ── 1. Drop panel rows without a WOZ value ───────────────────────────────────
+n_before   <- nrow(cbs_panel)
+cbs_panel  <- cbs_panel %>% filter(!is.na(woz_avg_k))
+cat("Dropped", n_before - nrow(cbs_panel), "panel rows with missing WOZ.\n")
+
+# ── 2. Add derived variables to the full panel ────────────────────────────────
+# delta_singles_lag1 = Singlesᵢ,ₜ₋₁ − Singlesᵢ,ₜ₋₂
+# Requires at least 3 years of data per district; NA otherwise.
+cbs_panel <- cbs_panel %>%
+  arrange(wijk_code, year) %>% # Sort the data by wijk code first, then by year within each wijk (for lag())
+  group_by(wijk_code) %>% # All subsequent operations should be done separately for each wijk
+  mutate(
+    log_woz            = log(woz_avg_k * 1000), # woz_avg_k is in thousands of euros, so multiplying by 1000 converts it back to euros before taking the log
+    gemeente_fe        = factor(gemeente_code), # Converts from string, e.g. "GM0344", to factor variable (for categorical fixed effect)
+    singles_std        = as.numeric(scale(pct_single_hh)), # Standardised pct_single_hh, used for exploratory analysis
+    lag1_singles       = lag(pct_single_hh, 1),   # Singlesᵢ,ₜ₋₁
+    lag2_singles       = lag(pct_single_hh, 2),   # Singlesᵢ,ₜ₋₂
+    delta_singles_lag1 = lag1_singles - lag2_singles
+  ) %>%
+  ungroup() %>% # Removes the grouping so subsequent operations apply to the whole data frame again, not separately per wijk
+  select(-lag1_singles, -lag2_singles)  # intermediate columns no longer needed
+
+# ── 3. Save panel and 2023 cross-section ─────────────────────────────────────
+saveRDS(cbs_panel, "data/processed/cbs_panel.rds")
+
+cbs_clean <- cbs_panel %>% filter(year == 2023)
+saveRDS(cbs_clean, "data/processed/cbs_clean.rds")
+
+# ── 4. Diagnostics ───────────────────────────────────────────────────────────
+n_delta <- sum(!is.na(cbs_panel$delta_singles_lag1))
+cat("Panel rows with delta_singles_lag1 available:", n_delta,
+    "(out of", nrow(cbs_panel), ")\n")
+cat("2023 cross-section:", nrow(cbs_clean), "districts\n")
+```
+
+**Output check:** the diagnostics confirm three expected results. Zero rows dropped for missing WOZ means the per-year caches already passed this filter on a previous run, loading from `PANEL_RDS` gives an already-clean panel. The `delta_singles_lag1` count of ~16,721 out of ~24,188 is correct because the variable requires two prior years of data: 2016 and 2017 rows are always NA (no lag available), leaving 6 years × ~2,800 wijken ≈ 16,800 valid observations. The 2023 cross-section of 3,232 wijken is consistent with all prior steps.
+
+
+## Missingness Check
+
+Before moving to modelling it is important to understand how much data is missing and why. This matters for two reasons: missing values reduce the regression sample size, and if missingness is systematic (e.g. always in small or rural districts) it could bias the estimates. We check all key analysis variables on the 2023 cross-section.
+
+```{r cbs-missing}
+key_vars <- c("woz_avg_k", "dist_primary_school", "n_schools_3km",
+              "pct_single_hh", "pct_age_0_14", "pct_owner_occupied",
+              "income_avg_k", "pct_employed", "pop_density_km2", "cars_per_hh")
+
+cbs_clean %>% # Check of 2023 cross sectional data
+  select(all_of(key_vars)) %>% # Selects listed above variables
+  summarise(across(everything(), ~ sum(is.na(.)))) %>% # Counts NAs per column
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>% # Each variable is a raw
+  mutate(pct_missing = round(100 * n_missing / nrow(cbs_clean), 1)) %>% # Percentage of missing
+  print()
+```
+
+The missingness pattern is exactly as expected and has a clear explanation for every variable:
+
+- **`woz_avg_k`: 0** — by construction, since we filtered out rows without a WOZ value in the cleaning step.
+- **`dist_primary_school`, `n_schools_3km`: 1 each** — negligible (essentially 0%), likely one unusually configured district. No action needed.
+- **`pct_single_hh`, `pct_age_0_14`, `pct_owner_occupied`: 0** — fully observed, no concerns.
+- **`income_avg_k`: 221 missing (6.8%) and `pct_employed`: 159 missing (4.9%)** — this is a known CBS privacy rule. For very small districts (typically fewer than 100–150 households), CBS suppresses income and employment figures to prevent identification of individual residents. This is not random missingness — it is concentrated in the smallest, most rural wijken. These will be dropped by listwise deletion when the regression sample is formed, which is acceptable given that we already exclude districts with fewer than 500 residents.
+- **`cars_per_hh`: 133 missing (4.1%)** — same mechanism as income and employment. CBS suppresses car ownership figures for the smallest districts. Most of these overlap with the districts already excluded by the population filter.
+
+---
+
+# Spatial Join: School Distances
+
+The CBS data provides `dist_primary_school`, the average distance from residential addresses in each wijk to the nearest primary school, as reported by CBS itself. This is our main proximity variable. However, as a robustness check we also compute our own distance measure from raw school coordinates, which allows us to verify the CBS figures and compute additional spatial variables (school density buffers, distances to good vs standard schools).
+
+This section builds those spatial measures in three steps: (1) load wijk boundary polygons, (2) load DUO school point locations, (3) compute nearest-school distances and buffer counts.
+
+All spatial objects are projected to **RD New (EPSG:28992)**, the Dutch national coordinate reference system. RD New uses metres as its unit, which means distance calculations are straightforward and accurate without any trigonometric correction. This is the standard CRS for Dutch geospatial work.
+
+## Loading CBS District Shapefiles
+
+The official CBS wijk boundary polygons are downloaded from PDOK (the Dutch national geodata platform). The chunk tries three sources in sequence, a paginated WFS GeoJSON download, and two versions of a CBS ZIP file — falling back to the next if the previous fails. This makes the script resilient to URL changes, which happen occasionally as CBS updates its data portal.
+
+After loading, the district code column is standardised to `WijkBuurtcode` regardless of how it was named in the source file, and the object is saved locally so the download only runs once.
+
+```{r shapefiles, cache=TRUE}
+message("Loading CBS wijk shapefile ...")
+
+# ── Load from local cache if available ───────────────────────────────────────
+wijken_sf <- NULL # Code below checks is.null(wijken_sf) to decide whether a download is needed
+if (file.exists("data/raw/wijken_sf.rds")) { # Check the local cache
+  tmp <- readRDS("data/raw/wijken_sf.rds") # Load the cache
+  if (inherits(tmp, "sf") && nrow(tmp) > 0) { # 2 checks: actually spatial(sf) object; at least 1 row of data
+    wijken_sf <- tmp # If the cache passed validation, assign it to wijken_sf and print a confirmation 
+    message("Loaded wijken_sf from local cache: ", nrow(wijken_sf), " features")
+  } else { # Reject a bad cache
+    message("Cache found but not a valid sf object — re-downloading ...")
+  }
+}
+
+# ── Download if cache not available ──────────────────────────────────────────
+# Attempt 1: PDOK WFS via paginated GeoJSON download (1000 features per page)
+if (is.null(wijken_sf)) tryCatch({
+  message("Trying PDOK WFS GeoJSON download (paginated) ...")
+  wfs_base <- paste0(
+    "https://service.pdok.nl/cbs/wijkenbuurten/2023/wfs/v1_0", # Build the base URL
+    "?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature", # The URL is split across multiple strings just for readability
+    "&TYPENAMES=wijken&OUTPUTFORMAT=application%2Fjson",
+    "&COUNT=1000"
+  )
+  pages <- list() # List that will collect each batch of 1000 features
+  start <- 0 # Index of the first feature to request. It starts at 0 and increments by 1000 each loop
+  repeat { # Start the download loop
+    url <- paste0(wfs_base, "&STARTINDEX=", start)
+    tmp <- tempfile(fileext = ".json")
+    httr::GET(url, httr::timeout(120), httr::write_disk(tmp, overwrite = TRUE))
+    page <- st_read(tmp, quiet = TRUE)
+    if (nrow(page) == 0) break
+    pages[[length(pages) + 1]] <- page
+    message("  Downloaded ", start + nrow(page), " features so far ...")
+    if (nrow(page) < 1000) break
+    start <- start + 1000
+  }
+  wijken_sf <- do.call(rbind, pages)
+  message("PDOK WFS GeoJSON succeeded: ", nrow(wijken_sf), " features total.")
+}, error = function(e) message("Attempt 1 failed: ", e$message))
+
+# Attempt 2: CBS ZIP — 2023 version 1
+if (is.null(wijken_sf) || nrow(wijken_sf) == 0) {
+  tryCatch({
+    message("Trying CBS ZIP download (v1) ...")
+    zip_url  <- "https://www.cbs.nl/-/media/cbs/dossiers/nederland-regionaal/wijk-en-buurtstatistieken/2023/shape-2023-versie-1-0.zip"
+    zip_path <- "data/raw/wijken_2023.zip"
+    download.file(zip_url, zip_path, mode = "wb", quiet = TRUE)
+    unzip(zip_path, exdir = "data/raw/wijken_2023", overwrite = TRUE)
+    shp_file <- list.files("data/raw/wijken_2023", pattern = "\\.shp$",
+                           full.names = TRUE, recursive = TRUE)
+    wijken_sf <- st_read(shp_file[1], quiet = TRUE) %>%
+      filter(grepl("^WK", WK_CODE))
+    message("CBS ZIP v1 succeeded.")
+  }, error = function(e) message("Attempt 2 failed: ", e$message))
+}
+
+# Attempt 3: CBS ZIP — 2023 version 2
+if (is.null(wijken_sf) || nrow(wijken_sf) == 0) {
+  tryCatch({
+    message("Trying CBS ZIP download (v2) ...")
+    zip_url  <- "https://www.cbs.nl/-/media/cbs/dossiers/nederland-regionaal/wijk-en-buurtstatistieken/2023/shape-2023-versie-2-0.zip"
+    zip_path <- "data/raw/wijken_2023_v2.zip"
+    download.file(zip_url, zip_path, mode = "wb", quiet = TRUE)
+    unzip(zip_path, exdir = "data/raw/wijken_2023_v2", overwrite = TRUE)
+    shp_file <- list.files("data/raw/wijken_2023_v2", pattern = "\\.shp$",
+                           full.names = TRUE, recursive = TRUE)
+    wijken_sf <- st_read(shp_file[1], quiet = TRUE) %>%
+      filter(grepl("^WK", WK_CODE))
+    message("CBS ZIP v2 succeeded.")
+  }, error = function(e) message("Attempt 3 failed: ", e$message))
+}
+
+if (is.null(wijken_sf) || nrow(wijken_sf) == 0) {
+  stop("All shapefile download attempts failed. The spatial robustness section will be skipped. ",
+       "The main analysis can proceed using dist_primary_school from CBS.")
+}
+
+# Project to RD New
+wijken_sf <- wijken_sf %>% st_transform(28992)
+
+# Standardise the district code column name
+code_col <- names(wijken_sf)[grepl("WK_CODE|WijkBuurtcode|statcode|wijkcode",
+                                    names(wijken_sf), ignore.case = TRUE)][1]
+wijken_sf <- wijken_sf %>% rename(WijkBuurtcode = all_of(code_col))
+
+message("Wijken loaded: ", nrow(wijken_sf), " features | CRS: EPSG:28992")
+saveRDS(wijken_sf, "data/raw/wijken_sf.rds")
+```
+
+## Loading DUO School Locations
+
+DUO (Dienst Uitvoering Onderwijs) is the Dutch government agency responsible for education administration. It publishes open data on all registered schools, including geocoded addresses for primary schools (*hoofdvestigingen basisonderwijs*). We download the most recent file and convert it to an `sf` point object projected to RD New, so it is in the same CRS (Coordinate Reference System) as the wijk polygons and distances can be computed in metres.
+
+The chunk handles three possible coordinate formats that DUO has used across different file versions: direct latitude/longitude columns, RD New x/y columns, and postcode-only (which requires geocoding via the PDOK Locatieserver API). This makes the download robust to future file format changes. Schools with a recorded closure date are dropped so only active schools are retained.
+
+```{r duo-schools, cache=TRUE}
+message("Downloading DUO primary school locations ...")
+
+# Correct URL as of May 2026 (DUO restructured their open data portal)
+duo_url  <- "https://duo.nl/open_onderwijsdata/images/01.-hoofdvestigingen-basisonderwijs.csv"
+duo_path <- "data/raw/duo_po_hoofdvestigingen.csv"
+download.file(duo_url, duo_path, mode = "wb", quiet = TRUE)
+duo_raw <- read.csv2(duo_path, fileEncoding = "latin1", stringsAsFactors = FALSE)
+
+message("DUO columns: ", paste(names(duo_raw), collapse = ", "))
+
+duo_schools <- NULL
+
+has_latlon   <- all(c("LATITUDE", "LONGITUDE") %in% names(duo_raw))
+has_rdnew    <- all(c("XCOORD", "YCOORD") %in% names(duo_raw))
+has_postcode <- "POSTCODE" %in% names(duo_raw)
+
+if (has_latlon) {
+  duo_schools <- duo_raw %>%
+    filter(!is.na(LATITUDE), !is.na(LONGITUDE), LATITUDE != 0) %>%
+    st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = 4326) %>%
+    st_transform(28992)
+  message("Used LATITUDE/LONGITUDE columns.")
+
+} else if (has_rdnew) {
+  duo_schools <- duo_raw %>%
+    filter(!is.na(XCOORD), !is.na(YCOORD), XCOORD != 0) %>%
+    st_as_sf(coords = c("XCOORD", "YCOORD"), crs = 28992)
+  message("Used XCOORD/YCOORD columns.")
+
+} else if (has_postcode) {
+  # No direct coordinates — geocode via PDOK Locatieserver using postcode
+  message("No coordinate columns found. Geocoding ", nrow(duo_raw),
+          " schools via PDOK Locatieserver (postcode-level) ...")
+
+  geocode_postcode <- function(pc) {
+    pc <- gsub(" ", "", pc)
+    if (is.na(pc) || nchar(pc) < 6) return(c(NA_real_, NA_real_))
+    url <- paste0(
+      "https://api.pdok.nl/bzk/locatieserver/search/v3_1/free",
+      "?q=", URLencode(pc), "&rows=1&fq=type:postcode&fl=centroide_rd"
+    )
+    tryCatch({
+      resp  <- httr::GET(url, httr::timeout(8))
+      res   <- jsonlite::fromJSON(httr::content(resp, "text", encoding = "UTF-8"))
+      if (res$response$numFound > 0) {
+        pt <- res$response$docs$centroide_rd[1]
+        xy <- as.numeric(strsplit(gsub("POINT\\(|\\)", "", pt), " ")[[1]])
+        return(xy)
+      }
+    }, error = function(e) NULL)
+    return(c(NA_real_, NA_real_))
+  }
+
+  # Deduplicate postcodes to minimise API calls
+  pcs <- unique(duo_raw$POSTCODE)
+  message("Unique postcodes to geocode: ", length(pcs))
+  coords_list <- lapply(seq_along(pcs), function(i) {
+    if (i %% 200 == 0) message("  ... ", i, " / ", length(pcs))
+    Sys.sleep(0.05)   # ~20 req/s — stays well within PDOK limits
+    xy <- geocode_postcode(pcs[i])
+    data.frame(POSTCODE = pcs[i], x_rd = xy[1], y_rd = xy[2],
+               stringsAsFactors = FALSE)
+  })
+  pc_coords <- do.call(rbind, coords_list)
+
+  duo_geo <- duo_raw %>%
+    left_join(pc_coords, by = "POSTCODE") %>%
+    filter(!is.na(x_rd), !is.na(y_rd))
+
+  duo_schools <- duo_geo %>%
+    st_as_sf(coords = c("x_rd", "y_rd"), crs = 28992)
+  message("Geocoded ", nrow(duo_schools), " schools via PDOK postcode lookup.")
+
+} else {
+  message("Could not find or derive coordinates. Check DUO column names above.")
+}
+
+if (!is.null(duo_schools)) {
+  # Drop schools that have been closed (if column present)
+  close_col <- grep("OPHEFFING|EINDDATUM", names(duo_schools),
+                    value = TRUE, ignore.case = TRUE)[1]
+  if (!is.na(close_col)) {
+    duo_schools <- duo_schools %>%
+      filter(is.na(.data[[close_col]]) | .data[[close_col]] == "")
+  }
+  message("Active primary schools ready: ", nrow(duo_schools))
+  saveRDS(duo_schools, "data/raw/duo_schools_sf.rds")
+} else {
+  message("DUO school data unavailable — spatial robustness check will be skipped.")
+  message("Main analysis proceeds using dist_primary_school from CBS.")
+}
+```
+
+## Computing Distance to Nearest School
+
+For each wijk we need a single distance value, the distance from the wijk to its nearest primary school. Rather than computing a full distance matrix between all wijken and all schools (which would be ~3,300 × 6,000 = ~20 million pairs), we use `st_nn()` from the `nngeo` package, which implements a fast nearest-neighbour search. Setting `k = 1` retrieves only the single closest school per wijk.
+
+The distance is measured from the **wijk centroid** (the geometric centre of the wijk polygon) to the nearest school point. This is our robustness measure (`dist_school_centroid_km`). The main proximity variable (`dist_primary_school` from CBS) is based on the average distance from all residential addresses in the wijk, which is a more precise measure but only available from CBS directly. The two measures should correlate strongly; any divergence between them in the robustness checks tells us something about how sensitive results are to the exact distance operationalisation.
+
+```{r nearest-school, cache=TRUE}
+if (is.null(duo_schools)) {
+  message("Skipping nearest-school computation — DUO data unavailable.")
+  wijken_centroids <- NULL
+} else {
+  # Compute district centroids
+  wijken_centroids <- wijken_sf %>%
+    st_centroid() %>%
+    select(WijkBuurtcode)
+
+  message("Computing nearest-school distances (may take ~30 seconds) ...")
+
+  nn_result <- st_nn(
+    x          = wijken_centroids,
+    y          = duo_schools,
+    k          = 1,
+    returnDist = TRUE,
+    progress   = TRUE
+  )
+
+  wijken_centroids$dist_school_centroid_km <- sapply(nn_result$dist, `[`, 1) / 1000
+
+  cat("\nSummary — centroid-to-nearest-school distance (km):\n")
+  print(summary(wijken_centroids$dist_school_centroid_km))
+}
+```
+The distances are plausible for the Netherlands. A median of ~0.70 km means most wijk centroids are within walking distance of a school, expected in a densely built country. The mean (~1.01 km) is slightly higher than the median due to rural outliers, producing a mild right skew. The maximum (~11.5 km) corresponds to very remote rural districts in provinces like Drenthe or Zeeland. The minimum (~4 m) is a wijk centroid that falls essentially on top of a school building, which can happen in compact inner-city wijken.
+
+
+## Counting Schools Within Radius Buffers
+
+Distance to the nearest school captures proximity but not density — a wijk with one school 300m away and a wijk with five schools within 300m both get the same nearest-school distance. As a complementary measure we count how many schools fall within a 1 km radius buffer around each wijk centroid. The 1 km threshold is chosen because it is close to the mean CBS distance (~0.91 km). This school density measure is used in robustness checks and may capture the nuisance dimension (more schools = more traffic and noise) better than a single nearest-school distance.
+
+The `st_buffer()` function draws a circle of the specified radius around each centroid point, and `st_intersects()` counts how many school points fall inside it.
+
+```{r school-buffers, cache=TRUE}
+if (is.null(wijken_centroids)) {
+  message("Skipping school buffer counts — DUO data unavailable.")
+  message("Spatial robustness check skipped; main analysis uses CBS dist_primary_school.")
+} else {
+  count_in_buffer <- function(pts, targets, radius_m) {
+    lengths(st_intersects(st_buffer(pts, dist = radius_m), targets))
+  }
+
+  wijken_centroids$n_schools_1km  <- count_in_buffer(wijken_centroids, duo_schools, 1000)
+
+  # Save spatial variables as a plain data frame (drop geometry)
+  spatial_vars <- wijken_centroids %>%
+    st_drop_geometry() %>%
+    rename(wijk_code = WijkBuurtcode)
+
+  saveRDS(spatial_vars, "data/processed/spatial_vars.rds")
+  message("Spatial variables saved.")
+}
+```
+
+## School Quality Classification
+
+Not all schools are equal in the eyes of housing markets. Gibbons & Machin (2006) found that only the top-performing schools generate a price premium, for the remaining schools, proximity is either neutral or a mild discount due to externalities. To test this in the Dutch context, we classify each school as **good** (top 20% by standardised test score) or **standard** (bottom 80%) and compute separate distances to each type per wijk.
+
+Dutch primary schools use the *doorstroomtoets* as a standardised exit test, but six different test providers exist (IEP, LVS, Route 8, DIA, AMN, DOE), each with its own scale. Directly comparing raw scores across providers would be meaningless, a score of 80 on one test is not the same as 80 on another. The solution is to **standardise within provider** first: for each provider, subtract the mean and divide by the standard deviation. This puts all schools on a common scale (z-scores), after which a single global percentile rank is computed across all schools. Schools at or above the 80th percentile are flagged as `good_school = TRUE`.
+
+The chunk picks the first non-missing, non-zero test score per school (some schools may appear in the file with scores from multiple providers or with zero placeholders) and deduplicates on BRIN code (the unique school identifier).
+
+```{r school-quality-scoring}
+# ── Download DUO doorstroomtoets scores 2023-2024 (pure base R) ──────────────
+scores_url  <- "https://duo.nl/open_onderwijsdata/images/05.-gemiddelde-eindscores-bo-sbo-2023-2024.csv"
+scores_path <- "data/raw/duo_eindscores_2023_2024.csv"
+if (!file.exists(scores_path))
+  download.file(scores_url, scores_path, mode = "wb", quiet = TRUE)
+
+scores_raw <- read.csv2(scores_path, stringsAsFactors = FALSE,
+                        check.names = FALSE, fileEncoding = "UTF-8-BOM")
+
+test_cols <- c("IEP_GEM", "LIB_GEM", "ROUTE8_GEM", "DIA_GEM", "AMN_GEM", "DOE_GEM")
+sc        <- scores_raw[, c("INSTELLINGSCODE", test_cols)]
+for (col in test_cols) sc[[col]] <- as.numeric(gsub(",", ".", sc[[col]]))
+
+# Pick first non-zero test score for each school
+test_used <- character(nrow(sc))
+raw_score <- numeric(nrow(sc))
+for (i in seq_len(nrow(sc))) {
+  v <- as.numeric(sc[i, test_cols])
+  k <- which(!is.na(v) & v > 0)
+  if (length(k)) { test_used[i] <- test_cols[k[1]]; raw_score[i] <- v[k[1]] }
+  else            { test_used[i] <- NA_character_;   raw_score[i] <- NA_real_ }
+}
+sc$test_used <- test_used
+sc$raw_score <- raw_score
+sc <- sc[!is.na(sc$raw_score), c("INSTELLINGSCODE", "test_used", "raw_score")]
+sc <- sc[!duplicated(sc$INSTELLINGSCODE), ]
+
+# Standardise within provider, global percentile rank, top-20% flag
+sc$score_std   <- ave(sc$raw_score, sc$test_used,
+                      FUN = function(x) (x - mean(x)) / sd(x))
+sc$score_pct   <- rank(sc$score_std, ties.method = "average") / nrow(sc)
+sc$good_school <- sc$score_pct >= 0.80
+scores_school  <- sc
+
+cat("Schools scored:", nrow(scores_school), "\n")
+cat("Good (top 20%):", sum(scores_school$good_school), "\n")
+cat("Standard:", sum(!scores_school$good_school), "\n")
+print(table(scores_school$test_used))
+```
+
+```{r school-quality-join}
+# ── Attach quality flag to sf object using cbind() ───────────────────────────
+if (!exists("duo_schools") || is.null(duo_schools))
+  duo_schools <- readRDS("data/raw/duo_schools_sf.rds")
+
+brin_col <- grep("INSTELLINGSCODE|BRIN", names(duo_schools),
+                 ignore.case = TRUE, value = TRUE)[1]
+cat("Joining on:", brin_col, "\n")
+
+idx       <- match(duo_schools[[brin_col]], scores_school$INSTELLINGSCODE)
+good_flag <- scores_school$good_school[idx]
+good_flag[is.na(good_flag)] <- FALSE
+pct_flag  <- scores_school$score_pct[idx]
+
+# Reconstruct sf explicitly: drop geometry, add columns, reattach geometry
+duo_df              <- sf::st_drop_geometry(duo_schools)
+duo_df$good_school  <- good_flag
+duo_df$score_pct    <- pct_flag
+duo_schools_quality <- sf::st_sf(duo_df, geometry = sf::st_geometry(duo_schools))
+
+good_schools_sf <- duo_schools_quality[duo_schools_quality$good_school,  ]
+std_schools_sf  <- duo_schools_quality[!duo_schools_quality$good_school, ]
+
+cat("class(good_schools_sf):", paste(class(good_schools_sf), collapse = ", "), "\n")
+cat("Good school sf rows:", nrow(good_schools_sf), "\n")
+cat("Standard school sf rows:", nrow(std_schools_sf), "\n")
+
+cat("Good school locations matched:", nrow(good_schools_sf), "\n")
+cat("Standard school locations matched:", nrow(std_schools_sf), "\n")
+```
+
+Both chunks ran correctly. 6,103 schools scored in total, of which 1,207 good and 4,791 standard locations were matched to the sf object (1,207 + 4,791 = 5,998 matched). This leaves 105 unmatched schools (6,103 − 5,998 = 105), a 1.7% non-match rate — still excellent overall. The unmatched schools are likely those that closed, merged, or changed BRIN codes between the doorstroomtoets scoring file and the geocoding file, both from DUO but from slightly different publication dates.
+
+## Distances to Good and Standard Schools
+
+```{r school-quality-distances, cache=TRUE}
+library(nngeo)
+
+# Ensure wijken_centroids is an sf object in memory
+if (!exists("wijken_centroids") || is.null(wijken_centroids) ||
+    !inherits(wijken_centroids, "sf")) {
+  wijk_tmp <- readRDS("data/raw/wijken_sf.rds")
+  if (!inherits(wijk_tmp, "sf")) {
+    stop("wijken_sf.rds is a plain data frame — please run the 'shapefiles' ",
+         "and 'nearest-school' chunks first to recreate wijken_centroids as an sf object.")
+  }
+  wijken_centroids <- sf::st_centroid(wijk_tmp) |>
+                      dplyr::select(WijkBuurtcode)
+  message("wijken_centroids reconstructed from wijken_sf.rds")
+}
+
+if (is.null(wijken_centroids) || nrow(good_schools_sf) == 0) {
+  message("Skipping school quality distances — required data unavailable.")
+} else {
+  message("Computing distances to nearest good school ...")
+  nn_good <- st_nn(wijken_centroids, good_schools_sf,
+                   k = 1, returnDist = TRUE, progress = FALSE)
+
+  message("Computing distances to nearest standard school ...")
+  nn_std  <- st_nn(wijken_centroids, std_schools_sf,
+                   k = 1, returnDist = TRUE, progress = FALSE)
+
+  wijken_centroids$dist_good_school_km <- sapply(nn_good$dist, `[`, 1) / 1000
+  wijken_centroids$dist_std_school_km  <- sapply(nn_std$dist,  `[`, 1) / 1000
+
+  cat("Distance to nearest good school (km):\n")
+  print(summary(wijken_centroids$dist_good_school_km))
+  cat("\nDistance to nearest standard school (km):\n")
+  print(summary(wijken_centroids$dist_std_school_km))
+
+  # Append new columns to existing spatial_vars rather than overwriting
+  new_cols <- data.frame(
+    wijk_code           = wijken_centroids$WijkBuurtcode,
+    dist_good_school_km = wijken_centroids$dist_good_school_km,
+    dist_std_school_km  = wijken_centroids$dist_std_school_km
+  )
+
+  if (file.exists("data/processed/spatial_vars.rds")) {
+    spatial_vars <- readRDS("data/processed/spatial_vars.rds")
+    spatial_vars <- spatial_vars %>%
+      select(-any_of(c("dist_good_school_km", "dist_std_school_km"))) %>%
+      left_join(new_cols, by = "wijk_code")
+  } else {
+    spatial_vars <- new_cols
+  }
+
+  saveRDS(spatial_vars, "data/processed/spatial_vars.rds")
+  cat("spatial_vars columns:", ncol(spatial_vars), "\n")
+  message("Spatial variables updated with school quality distances.")
+}
+```
+The quality-split distances make intuitive sense. Good schools have a median of ~2.15 km and mean of ~2.79 km — substantially further than standard schools (median ~0.82 km, mean ~1.20 km). This ratio of roughly 2.6x is entirely expected: there are far fewer good schools (~1,207 vs ~4,791 standard schools), so on average a wijk has to look further to find one. The maximum distance of ~26 km for good schools reflects a remote rural wijk with no high-performing school nearby — a meaningful real-world finding that illustrates the geographic concentration of school quality in the Netherlands. All spatial variables are appended to `spatial_vars.rds` for merging with the CBS data in the next section.
+
+---
+
+# Merge and Exploratory Data Analysis
+
+## Merging CBS and Spatial Data
+
+At this point we have two separate data objects: the CBS panel with all demographic, housing, and car ownership variables, and `spatial_vars` with the school distance and density measures computed from DUO coordinates. We join them on `wijk_code` using a left join — keeping all CBS districts and attaching spatial variables where available. If `spatial_vars.rds` is missing (e.g. the spatial chunks were skipped), the script substitutes NA columns so the rest of the pipeline doesn't break.
+
+```{r merge}
+cbs <- readRDS("data/processed/cbs_clean.rds")
+
+if (file.exists("data/processed/spatial_vars.rds")) {
+  sp_vars <- readRDS("data/processed/spatial_vars.rds")
+  df <- cbs %>% left_join(sp_vars, by = "wijk_code")
+  message("Spatial distance matched: ",
+          sum(!is.na(df$dist_school_centroid_km)), " districts")
+} else {
+  message("Spatial vars not found — using CBS proximity measures only (dist_primary_school).")
+  df <- cbs %>%
+    mutate(dist_school_centroid_km = NA_real_,
+           n_schools_1km           = NA_integer_,
+           n_schools_1km           = NA_integer_)
+}
+
+message("Merged dataset: ", nrow(df), " rows x ", ncol(df), " columns")
+```
+The merge produces ~3,232 rows and ~31 columns. The drop from 3,352 to 3,232 happened in the `cbs-clean` chunk earlier — CBS suppresses WOZ values for very small districts. All remaining districts found a spatial match, confirming the `wijk_code` keys are consistent between the CBS and DUO/spatial datasets.
+
+## Choosing the Proximity Variable
+
+We now have two school distance measures: `dist_primary_school` (CBS-reported average distance from all residential addresses to the nearest school) and `dist_school_centroid_km` (our own centroid-based measure). The CBS measure is preferred as the main variable because it better reflects the actual residential experience of households. The centroid measure serves as a sensitivity check (Appendix).
+
+`prox_main` is created as the CBS distance, falling back to the centroid measure only if the CBS value is missing for a given district (`coalesce()`). `log_prox` is a log-transformed version available for robustness checks. `school_density_3km` simply renames the CBS-provided `n_schools_3km` for clarity.
+
+```{r proximity-var}
+df <- df %>%
+  mutate(
+    prox_main          = coalesce(dist_primary_school, dist_school_centroid_km), # if dist_primary_school NA, it takes dist_school_centroid_km value
+    log_prox           = log(prox_main + 0.01), # natural log, 0.01 is added to avoid negative infinity (distance = 0)
+    school_density_3km = n_schools_3km   # CBS reports schools within 3 km in 85618NED (renames)
+  )
+```
+
+## Final Sample Restrictions
+
+Before running any models, we apply five filters to form the regression sample. These are applied once here and the cleaned dataset is saved to disk — all subsequent analyses load from `analysis_data.rds` rather than re-applying the filters.
+
+```{r sample-filter}
+n_before <- nrow(df)
+
+df <- df %>%
+  filter(
+    !is.na(log_woz),
+    !is.na(prox_main),
+    !is.na(pct_single_hh),
+    !is.na(income_avg_k),
+    pop_total > 500
+  )
+
+message("Final sample: ", nrow(df), " districts (dropped ", n_before - nrow(df), ")")
+
+# Flag outlier districts (outside 1%–99% of WOZ distribution)
+p01 <- quantile(df$log_woz, 0.01)
+p99 <- quantile(df$log_woz, 0.99)
+df  <- df %>% mutate(woz_outlier = log_woz < p01 | log_woz > p99)
+
+# Add singles tercile for EDA plots
+df <- df %>%
+  mutate(
+    singles_tercile = case_when(
+      pct_single_hh <= quantile(pct_single_hh, 1/3, na.rm = TRUE) ~ "Low singles (family-rich)",
+      pct_single_hh <= quantile(pct_single_hh, 2/3, na.rm = TRUE) ~ "Medium singles",
+      TRUE                                                          ~ "High singles"
+    ),
+    singles_tercile = factor(singles_tercile,
+                             levels = c("Low singles (family-rich)",
+                                        "Medium singles", "High singles"))
+  )
+
+saveRDS(df, "data/processed/analysis_data.rds")
+```
+
+The message confirms how many districts were dropped and how many remain in the final sample. The five filters remove districts with missing WOZ, proximity, singles share, or income data (CBS suppresses values for very small or recently created areas), and exclude districts with fewer than 500 residents, where WOZ averages are based on too few transactions to be reliable. The 500-resident threshold is a standard choice in the CBS literature. The outlier flag (`woz_outlier`) marks districts outside the 1st–99th percentile of the log WOZ distribution — these are retained in the data but can be excluded in sensitivity checks. The `singles_tercile` variable splits districts into three equal-sized groups by singles share; it is used only for the exploratory heterogeneity plot (Figure 4) and does not enter any regression.
+
+---
+
+## Leefbaarometer: Neighbourhood Quality Control
+
+A key threat to identification in the cross-sectional model is that districts with good schools may also be generally nicer neighbourhoods — better maintained, safer, more cohesive — and those characteristics independently raise house prices. Without controlling for overall neighbourhood quality, the school proximity coefficient would absorb some of this neighbourhood quality premium, biasing our estimates.
+
+The Leefbaarometer (published by the Ministry of the Interior) addresses this directly. It is a composite liveability index covering five dimensions: housing stock quality, physical environment, local services and amenities, social cohesion, and safety/nuisance. It is published every two years for all Dutch wijken. We use the 2022 edition for the 2023 cross-section, and year-matched editions for the panel (2018→2018, 2019→2018, 2020→2020, 2021→2020, 2022→2022, 2023→2022).
+
+Unlike the CBS data, the Leefbaarometer is not available via API — it must be downloaded manually from the Ministry's website and placed in `data/raw/`. The chunk searches for the file automatically and stops with a clear error message if it is not found.
+
+## Downloading Leefbaarometer Data
+
+```{r lbm-download, cache=TRUE}
+# ── Locate the manually downloaded Leefbaarometer wijk scores CSV ────────────
+# Expected location: data/raw/leefbaarometer_wijken.csv
+# If not found, also search data/raw/ for any CSV with "wijken" or "wijk" in the name
+lbm_csv <- "data/raw/leefbaarometer_wijken.csv"
+
+if (!file.exists(lbm_csv)) {
+  candidates <- list.files("data/raw", pattern = "wijk", ignore.case = TRUE,
+                           full.names = TRUE)
+  candidates <- candidates[grepl("\\.csv$", candidates, ignore.case = TRUE)]
+  if (length(candidates) > 0) {
+    lbm_csv <- candidates[1]
+    cat("Found Leefbaarometer file at:", lbm_csv, "\n")
+  } else {
+    stop("Leefbaarometer wijk CSV not found in data/raw/.\n",
+         "Please copy 'Leefbaarometer-scores wijken 2002-2022.csv' from the\n",
+         "downloaded zip into data/raw/ and rename it 'leefbaarometer_wijken.csv'.")
+  }
+}
+
+lbm_raw <- read.csv(lbm_csv, stringsAsFactors = FALSE, check.names = FALSE)
+cat("Leefbaarometer:", nrow(lbm_raw), "rows x", ncol(lbm_raw), "cols\n")
+cat("Columns:", paste(names(lbm_raw), collapse = ", "), "\n")
+jaar_col <- grep("^jaar$|^year$", names(lbm_raw), ignore.case = TRUE, value = TRUE)[1]
+cat("Years available:", paste(sort(unique(lbm_raw[[jaar_col]])), collapse = ", "), "\n")
+cat("\nFirst 5 rows:\n")
+print(head(lbm_raw[, c("wk_code", jaar_col, "lbm")], 5))
+```
+
+## Standardising and Merging
+
+```{r lbm-merge}
+# ── Identify key columns ────────────────────────────────────────────────────
+# Leefbaarometer uses Dutch column names; detect them robustly
+code_col  <- grep("wk_code|wijkcode|code", names(lbm_raw), ignore.case = TRUE, value = TRUE)[1]
+year_col  <- grep("^jaar$|^year$", names(lbm_raw), ignore.case = TRUE, value = TRUE)[1]
+score_col <- grep("^lbm$|leefbaar|score", names(lbm_raw), ignore.case = TRUE, value = TRUE)[1]
+
+cat("Using columns — code:", code_col, "| year:", year_col, "| score:", score_col, "\n")
+
+# ── Year mapping: panel year → closest prior Leefbaarometer measurement ─────
+year_map <- c(
+  "2018" = 2018, "2019" = 2018,
+  "2020" = 2020, "2021" = 2020,
+  "2022" = 2022, "2023" = 2022
+)
+
+# ── Build clean Leefbaarometer table ────────────────────────────────────────
+lbm_clean <- lbm_raw %>%
+  rename(wijk_code  = all_of(code_col),
+         lbm_year   = all_of(year_col),
+         lbm_score  = all_of(score_col)) %>%
+  filter(lbm_year %in% c(2018, 2020, 2022)) %>%
+  mutate(wijk_code = str_trim(as.character(wijk_code)),
+         lbm_score = as.numeric(lbm_score)) %>%
+  select(wijk_code, lbm_year, lbm_score)
+
+cat("Leefbaarometer clean:", nrow(lbm_clean), "rows |",
+    n_distinct(lbm_clean$wijk_code), "unique wijken\n")
+
+# ── Merge onto 2023 cross-section (use 2022 score) ──────────────────────────
+lbm_2022 <- lbm_clean %>% filter(lbm_year == 2022) %>% select(wijk_code, lbm_score)
+
+df <- df %>%
+  select(-any_of("lbm_score")) %>%        # drop if re-running chunk
+  left_join(lbm_2022, by = "wijk_code")
+
+cat("Cross-section matched:", sum(!is.na(df$lbm_score)), "/", nrow(df), "\n")
+
+# ── Merge onto panel (use year-matched score) ────────────────────────────────
+# Note: panel_df is created in twfe-prep; this block is skipped if not yet in memory
+if (exists("panel_df")) {
+  panel_df <- panel_df %>%
+    select(-any_of(c("lbm_score", "lbm_year"))) %>%
+    mutate(lbm_year = as.integer(year_map[as.character(year)])) %>%
+    left_join(lbm_clean, by = c("wijk_code", "lbm_year")) %>%
+    select(-lbm_year)
+  cat("Panel matched:", sum(!is.na(panel_df$lbm_score)), "/", nrow(panel_df), "\n")
+} else {
+  message("panel_df not yet in memory — lbm join will be applied in twfe-prep.")
+}
+```
+The Leefbaarometer clean table has ~9,910 rows (3 years × ~3,303 wijken), matching the expected coverage. The cross-section match rate is ~95.3% (2,678/2,809) and the panel rate is ~95.5% (15,565/16,298) — the ~5% unmatched are very small or recently created wijken not covered by the Leefbaarometer. These will be dropped by listwise deletion in the regression sample, which is acceptable.
+
+The year mapping deserves a brief note: the Leefbaarometer is published every two years, so panel years without a direct match (2019, 2021, 2023) use the most recent prior edition. This means the liveability score is a lagged measure for odd years — a minor limitation acknowledged in the thesis.
+
+## Summary Statistics
+
+The summary statistics table covers all variables that appear in the regression models or are discussed in the descriptive analysis. This table will be included in the thesis — it gives the reader a sense of the data before any modelling, and allows the reader to assess whether the sample is representative of the Netherlands as a whole.
+
+**Data exploration table**
+
+```{r summary-stats}
+model_vars <- c(
+  "log_woz", "woz_avg_k",
+  "prox_main", "dist_school_centroid_km", "n_schools_3km",
+  "pct_single_hh", "pct_hh_with_children", "pct_hh_no_children",  # pct_hh_with_children kept for context; not used as regressor
+  "delta_singles_lag1",                       # lagged Δ singles — instrument
+  "income_avg_k", "pct_employed",
+  "pop_density_km2", "pct_age_0_14",          # pct_owner_occupied excluded: r = -0.85 with pct_single_hh
+  "pct_owner_occupied",                       # shown in table for descriptive context only
+  "cars_per_hh"                               # car ownership per household — mobility control
+)
+
+sumstats <- df %>%
+  select(all_of(intersect(model_vars, names(df)))) %>%
+  pivot_longer(everything(), names_to = "variable") %>%
+  group_by(variable) %>%
+  summarise(
+    N      = sum(!is.na(value)),
+    Mean   = round(mean(value,              na.rm = TRUE), 3),
+    SD     = round(sd(value,               na.rm = TRUE), 3),
+    Median = round(median(value,            na.rm = TRUE), 3),
+    Min    = round(min(value,              na.rm = TRUE), 3),
+    Max    = round(max(value,              na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+
+write.csv(sumstats, "output/tables/summary_stats.csv", row.names = FALSE)
+knitr::kable(sumstats, caption = "Descriptive statistics — wijk level")
+```
+
+**Paper-ready version**. It includes the dependent variable + every variable that appears in at least one main regression model.
+
+```{r summary-stats-paper-ready}
+# ── Descriptive statistics table using modelsummary::datasummary_skim ─────────
+# This replaces the manual pivot-longer approach with a publication-ready table.
+# Only the variables that appear in regression models (or as context) are included.
+library(kableExtra)
+
+ds_vars <- df %>%
+  select(
+    `Log WOZ value`                  = log_woz,
+    `Avg. WOZ value (k€)`            = woz_avg_k,
+    `Distance to school (km)`        = prox_main,
+    `Single-HH share (%)`            = pct_single_hh,
+    `ΔSingles share, lag 1 (%)`      = delta_singles_lag1,
+    `Cars per household`             = cars_per_hh,
+    `Avg. household income (k€)`     = income_avg_k,
+    `Employment rate (%)`            = pct_employed,
+    `Population density (per km²)`   = pop_density_km2,
+    `Share aged 0–14 (%)`            = pct_age_0_14,
+    `Owner-occupied (%)`             = pct_owner_occupied,
+    `Liveability score`              = lbm_score
+  )
+
+tbl_desc <- datasummary_skim(
+  ds_vars,
+  output    = "kableExtra",
+  title     = "Descriptive statistics — wijk level (cross-section, 2023)",
+  histogram = FALSE
+) |>
+  kable_styling(
+    bootstrap_options = c("striped", "condensed"),
+    full_width        = FALSE,
+    font_size         = 13,
+    html_font         = "Times New Roman, Times, serif"
+  )
+
+tbl_desc |> save_kable("output/tables/desc_stats.html", self_contained = TRUE)
+webshot2::webshot("output/tables/desc_stats.html",
+                  "output/figures/desc_stats.png", zoom = 2)
+```
+
+All values are plausible and internally consistent:
+
+- `log_woz` mean 12.8 → exp(12.8) ≈ €362k, consistent with `woz_avg_k` mean of €382k. The small difference reflects the inequality effect of log-transforming a right-skewed variable.
+- `pct_owner_occupied` mean ~66% — high homeownership typical for the Netherlands.
+- `income_avg_k` mean ~42k, median ~40k — plausible Dutch household income levels.
+- The three household-composition variables sum to ~100%: `pct_single_hh` (~34%) + `pct_hh_no_children` (~31%) + `pct_hh_with_children` (~34%) = ~100%, confirming CBS counts `hh_no_children` as multi-person households *without* children (not including singles).
+- `cars_per_hh` N=2,791 (slightly fewer than other variables) — consistent with the 133 suppressed values seen in the missingness check, with most of the suppressed districts already excluded by the pop > 500 filter.
+- `delta_singles_lag1` N≈2,556 — 253 districts in the 2023 cross-section lack sufficient panel history for the lag calculation. These receive NA and are excluded from panel models but not cross-sectional ones.
+
+Note: `pct_hh_with_children` is shown for descriptive context but is not used in any regression — it is replaced by `pct_age_0_14` to avoid the high collinearity with `pct_single_hh` (r = −0.85).
+
+## Figure 1: Key Variable Distributions
+
+Figure 1 combines the distributions of the dependent variable (panel A) and the key moderating variable (panel B) into a single two-panel figure. Together they justify both the log transformation of WOZ values and the plausibility of identifying a tipping point within the singles share distribution.
+
+```{r fig-distributions, fig.cap="(A) WOZ value distribution across Dutch districts; (B) Single-person household share distribution.", fig.width=11, fig.height=4.5}
+p_woz <- ggplot(df, aes(x = woz_avg_k)) +
+  geom_histogram(bins = 60, fill = "#2E5D9E", colour = "white", alpha = 0.85) +
+  scale_x_continuous(labels = scales::comma_format(suffix = "k€")) +
+  labs(
+    title    = "(A) Average WOZ value by district",
+    subtitle = "CBS Kerncijfers Wijken en Buurten, Netherlands",
+    x        = "Average WOZ value (thousands of euros)",
+    y        = "Number of districts"
+  )
+
+p_singles <- ggplot(df, aes(x = pct_single_hh)) +
+  geom_histogram(bins = 50, fill = "#E07B39", colour = "white", alpha = 0.85) +
+  geom_vline(xintercept = median(df$pct_single_hh, na.rm = TRUE),
+             linetype = "dashed", colour = "black", linewidth = 0.8) +
+  annotate("text",
+           x     = median(df$pct_single_hh, na.rm = TRUE) + 2,
+           y     = Inf, vjust = 2,
+           label = paste0("Median: ",
+                          round(median(df$pct_single_hh, na.rm = TRUE), 1), "%"),
+           size  = 3.5) +
+  labs(
+    title    = "(B) Single-person household share",
+    subtitle = "Key moderating variable — higher = more singles-dominant districts",
+    x        = "Share of single-person households (%)",
+    y        = "Number of districts"
+  )
+
+p_woz + p_singles
+```
+
+**Panel A**: The WOZ distribution is right-skewed with a peak around €300–400k and a long upper tail reaching ~€1.8M (premium Amsterdam canal districts and coastal areas). The mean (~€382k) exceeds the median (~€363k), confirming the skew. This is exactly why `log_woz` is the correct outcome variable — the log transformation compresses the right tail, producing a more symmetric distribution and yielding coefficients directly interpretable as percentage changes in house values.
+
+**Panel B**: The singles share distribution is right-skewed with a median of ~31% and a long tail reaching ~98% (inner-city Amsterdam and student-dominated districts). Most wijken cluster between 25–40%, with a substantial number above 50% — this tail is precisely the range where the tipping point hypothesis predicts a sign reversal. The existence of enough high-singles districts gives the models statistical power to identify the conditional tipping point found in Model H.
+
+## Figure 2:  Motivating Evidence
+
+Figure 2 presents two exploratory plots: the first shows the raw bivariate relationship between school proximity and WOZ values, and the second shows how that relationship differs across demographic groups — the visual preview of the tipping point hypothesis.
+
+```{r fig-motivating, fig.cap=c("Raw proximity–WOZ relationship.", "Proximity effect by single-person household share tercile."), fig.width=9, fig.height=5.5}
+p_prox <- ggplot(df, aes(x = prox_main, y = log_woz)) +
+  geom_point(alpha = 0.2, size = 0.8, colour = "#1F3864") +
+  geom_smooth(method = "loess", colour = "#E07B39", se = TRUE, linewidth = 1.1) +
+  scale_x_continuous(limits = c(0, 5)) +
+  labs(
+    title    = "School proximity and log WOZ values",
+    subtitle = "LOESS fit with 95% CI | x-axis clipped at 5km",
+    x        = "Distance to nearest primary school (km)",
+    y        = "Log average WOZ value"
+  )
+
+p_het <- ggplot(df, aes(x = prox_main, y = log_woz, colour = singles_tercile)) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.2) +
+  scale_x_continuous(limits = c(0, 4)) +
+  scale_colour_manual(
+    values = c("#1E7B4B", "#2E5D9E", "#C0392B"),
+    name   = "Single-person\nhousehold share"
+  ) +
+  labs(
+    title    = "Proximity effect by single-HH share tercile",
+    subtitle = "If H2 & H3 hold: green slope ↓ (premium), red slope ↑ (discount)",
+    x        = "Distance to nearest primary school (km)",
+    y        = "Log average WOZ value"
+  )
+
+print(p_prox)
+print(p_het)
+```
+**Figure 2a:** The LOESS curve shows a non-monotonic pattern: WOZ values increase with distance from 0 to ~2km, then gradually decline. There is no simple "closer = more valuable" relationship in the aggregate. This is not a problem — it is actually the central motivation for the research question. The likely explanation is urban-suburban confounding: urban districts have many schools nearby *and* lower WOZ (smaller apartments, more singles), while suburban districts have fewer schools *and* higher WOZ (larger family homes). These opposite forces cancel out in the raw data, masking the true proximity effect.
+
+Two technical features of the plot are worth noting. The vertical striping of points occurs because CBS rounds `dist_primary_school` to one decimal place — this is a measurement artifact and harmless. The widening confidence interval beyond 2km reflects the thinning of observations in that range.
+
+This figure motivates the regression directly: the aggregate relationship is confounded by spatial sorting, and municipality fixed effects are needed to isolate the within-gemeente proximity effect from the between-city variation.
+
+**Figure 2b:** All three lines have positive slopes — WOZ increases with distance in every tercile, which is the opposite of what H2 predicts for the family-rich (green) group. This is driven by the same urban-suburban confounding: family-rich districts tend to be suburban with large expensive houses *and* schools far away, while high-singles districts are urban with cheaper, denser housing *and* schools nearby. The slopes reflect this spatial sorting, not a genuine proximity effect.
+
+Two observations are worth noting for the thesis. First, the three lines are roughly parallel — the slopes are similar across groups — meaning the heterogeneity by demographic composition is not visible in unconditional data. This directly motivates the controlled regression: only after absorbing municipality fixed effects and socioeconomic controls can we isolate the within-gemeente proximity effect separately for each demographic group. Second, the red (high-singles) line sits consistently below the other two at every distance, confirming that higher singles share is associated with lower WOZ regardless of proximity — supporting the additional finding that `pct_single_hh` has an independent negative effect on house values.
+
+## Correlation Matrix
+
+Before running regressions, it is useful to examine pairwise correlations to anticipate potential multicollinearity and check that relationships go in the expected direction. Note that these are raw cross-sectional correlations, which include both within- and between-municipality variation. They will be inflated by spatial sorting — the within-gemeente correlations in the next subsection are the more relevant diagnostic for the regression.
+
+```{r correlation}
+corr_vars <- c("log_woz", "prox_main", "pct_single_hh",
+               "pct_hh_with_children", "pct_owner_occupied",
+               "income_avg_k", "pct_employed", "pop_density_km2", "pct_age_0_14",
+               "cars_per_hh", "lbm_score")
+
+corr_data   <- df %>% select(all_of(intersect(corr_vars, names(df)))) %>% drop_na()
+corr_matrix <- round(cor(corr_data), 2)
+
+knitr::kable(as.data.frame(corr_matrix), caption = "Pairwise correlation matrix")
+write.csv(as.data.frame(corr_matrix), "output/tables/correlation_matrix.csv")
+```
+
+The raw correlations reveal the expected patterns. `lbm_score` is the strongest correlate of WOZ (r = 0.78 within-gemeente, see below), confirming neighbourhood quality is a crucial control. `income_avg_k` is also strongly positive (r = 0.70). `pct_single_hh` is negatively associated with WOZ (r = −0.44) and strongly negatively correlated with `cars_per_hh` (r = −0.80) — urban singles own fewer cars. The high correlations between `pct_single_hh`, `pct_owner_occupied`, and `cars_per_hh` (all around ±0.82–0.85) reflect urban-suburban sorting that municipality fixed effects will largely absorb. The strong correlation of `pct_owner_occupied` with the key regressors motivates running Models A and B in parallel — Model A excludes `pct_owner_occupied` while Model B includes it — to assess whether adding this variable materially inflates standard errors through multicollinearity or whether the precision gain from controlling for tenure composition outweighs the cost. Same in panel specification with Models C and D.
+
+## Within-Municipality Correlation Matrix
+
+The cross-sectional correlations above are inflated by spatial sorting: cities simultaneously have high singles shares, low owner-occupation, and are denser. Municipality fixed effects remove this between-group variation. The table below shows correlations computed on **within-gemeente demeaned variables** — the variation actually used by the fixed-effects estimator.
+
+```{r correlation-within}
+corr_vars_model <- c("log_woz", "prox_main", "pct_single_hh",
+                     "pct_owner_occupied", "income_avg_k",
+                     "pct_employed", "pop_density_km2", "pct_age_0_14",
+                     "cars_per_hh", "lbm_score")
+
+within_corr <- df %>%
+  select(gemeente_code, all_of(intersect(corr_vars_model, names(df)))) %>%
+  drop_na() %>%
+  group_by(gemeente_code) %>%
+  mutate(across(where(is.numeric), ~ . - mean(.))) %>%
+  ungroup() %>%
+  select(-gemeente_code)
+
+within_matrix <- round(cor(within_corr), 2)
+
+knitr::kable(as.data.frame(within_matrix),
+             caption = "Within-municipality correlation matrix (gemeente-demeaned variables)")
+write.csv(as.data.frame(within_matrix),
+          "output/tables/correlation_within_gemeente.csv")
+```
+
+Municipality fixed effects remove the between-city variation that was inflating the raw correlations. Three within-gemeente findings are most relevant for model specification:
+
+**`pct_single_hh` vs `pct_owner_occupied` (r = −0.79 within-gemeente):** this dropped from −0.83 in the raw data, confirming that municipality FEs absorb a meaningful share of the collinearity. The within-gemeente correlation is high but below the informal 0.8 threshold, so `pct_owner_occupied` can be retained in the model. We estimate both versions (A without, B with) and compare standard errors to verify.
+
+**`cars_per_hh` vs `pct_single_hh` (r = −0.74 within-gemeente):** also high. This is important for Models H and J — the two moderators are substantially correlated within municipalities, meaning their interaction terms cannot be fully separated. The conditional tipping point in Section 10 must therefore be interpreted as reflecting the *joint* moderating role of demographics and car ownership.
+
+**`lbm_score` vs `log_woz` (r = +0.78 within-gemeente):** the Leefbaarometer is the single strongest predictor of WOZ within municipalities. Its correlations with the control variables are all moderate (income 0.54, owner-occupied 0.57, cars 0.40, singles −0.34), confirming it adds explanatory power without creating severe multicollinearity.
+
+Based on these diagnostics, the preferred baseline specification includes the Leefbaarometer score, with municipality fixed effects and standard errors clustered at the gemeente level.
+
+---
+
+# Regression Analysis
+
+The regression analysis proceeds in four steps. First, a **baseline hedonic model** (Model 0) establishes the average proximity effect within municipalities. Second, **interaction models** (A and B) test whether the singles share moderates that effect — the core test of H2 and H3. Third, a **panel TWFE model** (C and D) adds district and year fixed effects to exploit within-district variation over time and remove time-invariant district-level confounders. Fourth, **extensions** (E–J) investigate school quality heterogeneity and car ownership as a mobility moderator.
+
+All models use `fixest::feols()`, which is purpose-built for models with high-dimensional fixed effects and provides fast computation with clustered standard errors.
+
+```{r reg-setup}
+library(fixest)
+```
+
+## Baseline Hedonic Model
+
+Model 0 is the simplest hedonic specification: log WOZ regressed on school proximity and socioeconomic controls, with municipality fixed effects. It answers the question: *on average, within a municipality, do districts closer to a primary school have higher or lower WOZ values?* Standard errors are clustered at the gemeente level to account for within-municipality correlation in house prices across wijken.
+
+```{r m-baseline}
+m0 <- feols(
+  log_woz ~ prox_main + income_avg_k + pct_employed +
+            pop_density_km2 + pct_age_0_14 + lbm_score | gemeente_code,
+  data = df,
+  vcov = ~gemeente_code
+)
+summary(m0)
+```
+The baseline model establishes the core finding: within municipalities, each additional kilometre of distance from the nearest school is associated with approximately **3.9% higher WOZ** (β = 0.039, p < 0.001). **H1 is rejected** — school proximity is a price discount, not a premium. The Leefbaarometer score is by far the dominant predictor (β = 1.200\*\*\*, meaning a 0.1-unit improvement in liveability → ~12% higher WOZ), confirming neighbourhood quality control was essential. Population density is negative (β = −0.000\*\*\*) — denser districts have lower WOZ within municipalities once liveability is absorbed. The share of children aged 0–14 is positive and significant (β = 0.008\*\*\*), consistent with child-rich districts being relatively expensive family neighbourhoods. Income (0.006\*\*\*) and employment (0.007\*\*\*) are both positive as expected. Adj. R² = 0.899.
+
+
+## Interaction Models: Does Singles Share Moderate the Proximity Effect?
+
+Models A and B extend the baseline by adding `pct_single_hh` and its interaction with `prox_main`. In the notation of the research proposal, β₃ is the key parameter: a positive β₃ (i.e. `prox_main:pct_single_hh` > 0) was expected under H2 — assuming H1 holds, β₃ > 0 makes the marginal effect of distance less negative (premium weakens) as singles share rises. Model B additionally includes `pct_owner_occupied`, whose inclusion is justified by the SE comparison below.
+
+```{r m-interaction}
+# Model A — interaction, no pct_owner_occupied
+mA <- feols(
+  log_woz ~ prox_main * pct_single_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            lbm_score | gemeente_code,
+  data = df,
+  vcov = ~gemeente_code
+)
+
+# Model B — interaction, with pct_owner_occupied
+mB <- feols(
+  log_woz ~ prox_main * pct_single_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            pct_owner_occupied + lbm_score | gemeente_code,
+  data = df,
+  vcov = ~gemeente_code
+)
+```
+
+```{r m-controls-only-with-cars}
+# Model B0 — distance + singles + cars as plain controls (no interactions)
+mB0 <- feols(
+  log_woz ~ prox_main + pct_single_hh + cars_per_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            pct_owner_occupied + lbm_score | gemeente_code,
+  data = df,
+  vcov = ~gemeente_code
+)
+
+summary(mB0)
+```
+
+
+## Comparing Standard Errors: Model A vs. Model B
+
+A common concern when adding a highly correlated variable (`pct_owner_occupied`, within-gemeente r = −0.79 with `pct_single_hh`) is that standard errors on the key terms inflate, reducing precision. We compare SEs across the two models and apply a 20% inflation threshold — if SE inflation on the interaction term exceeds 20%, Model A is preferred; otherwise Model B is chosen.
+
+```{r se-comparison}
+key_terms <- c("prox_main", "pct_single_hh", "prox_main:pct_single_hh")
+
+se_compare <- data.frame(
+  Term      = key_terms,
+  SE_ModelA = se(mA)[key_terms],
+  SE_ModelB = se(mB)[key_terms]
+) %>%
+  mutate(
+    Inflation_pct = round(100 * (SE_ModelB / SE_ModelA - 1), 1)
+  )
+
+print(se_compare)
+cat("\nRule of thumb: prefer Model B if SE inflation on interaction term < 20%\n")
+
+# Choose preferred model for downstream plots
+m_preferred <- if (se_compare$Inflation_pct[3] < 20) mB else mA
+cat("Preferred model:", if (identical(m_preferred, mB)) "Model B" else "Model A", "\n")
+```
+All three key terms have SE changes well within the 20% threshold — `prox_main` and the interaction term actually tighten (negative inflation), and `pct_single_hh` inflates by only ~11%. Adding `pct_owner_occupied` improves rather than harms precision, confirming Model B as the preferred cross-sectional specification.
+
+## Regression Table
+
+```{r model-table}
+tbl_args <- list( # store all shared arguments in a list
+  models    = list("(0) Baseline" = m0, "(B0) Controls" = mB0, "(A) Interaction" = mA, "(B) + Owner-occ." = mB),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  coef_map  = c(
+    "prox_main"               = "Distance to school (km)",
+    "pct_single_hh"           = "Single-HH share (%)",
+    "cars_per_hh"             = "Cars per household",
+    "prox_main:pct_single_hh" = "Distance × Single-HH share",
+    "income_avg_k"            = "Avg. household income (k€)",
+    "pct_employed"            = "Employment rate (%)",
+    "pop_density_km2"         = "Population density (per km²)",
+    "pct_age_0_14"            = "Share aged 0–14 (%)",
+    "pct_owner_occupied"      = "Owner-occupied (%)",
+    "lbm_score"               = "Liveability score (Leefbaarometer)"
+  ),
+  gof_map   = c("nobs", "r.squared", "adj.r.squared"),
+  title     = "Hedonic regression: school proximity and log WOZ values",
+  notes     = "Municipality (gemeente) fixed effects in all models. Standard errors clustered at gemeente level."
+)
+
+# Display inline
+do.call(modelsummary, tbl_args)
+
+# Save to file
+do.call(modelsummary, c(tbl_args, list(output = "output/tables/regression_table.html")))
+```
+
+**Interpretation**
+
+*Model 0 — Baseline.* Each additional kilometre from the nearest school is associated with 3.9% higher WOZ within municipalities (β ≈ 0.039, p < 0.01). **H1 is rejected**: school proximity is on average a price discount, not a premium. This is the central finding of the cross-sectional analysis.
+
+*Models A and B — Interaction.* Adding the singles interaction changes the interpretation of the distance coefficient: it now represents the proximity effect only at singles share = 0, which is outside the observed data range. The coefficient rises to 0.049\*\* — not because the discount increased, but because the meaning of the coefficient changed. The meaningful quantity is the full marginal effect across the observed range (see marginal effects plot). `Single-HH share` is negative and significant in both models (β = −0.005\*\*\* in A, −0.003\*\* in B) — within municipalities, higher singles share independently lowers WOZ. The `Distance × Single-HH share` interaction is −0.000 in both models — **H2 and H3 are not supported** in this specification. Model B adds `owner-occupied` (β = 0.002\*\*\*), which tightens rather than inflates standard errors. Note that `share aged 0–14` loses significance in Model A (0.002) and is only marginally significant in B (0.003\*), reflecting collinearity with the singles share variable. Adj. R² rises from 0.899 (Model 0) to 0.907 (A) and 0.909 (B).
+
+## Marginal Effects Plot
+
+Even though the interaction term is not statistically significant in Models A/B, it is informative to visualise the full marginal effect of distance across the range of singles share. The marginal effect is: ∂log_woz/∂prox_main = β₁ + β₃ × pct_single_hh. We compute this at 200 equally spaced values of `pct_single_hh` from the observed minimum to maximum, with 95% confidence intervals obtained via the delta method (Brambor et al., 2006).
+
+```{r marginal-effects, fig.cap="Marginal effect of a 1 km increase in distance to school on log WOZ, by singles share. Shaded band: 95% CI (gemeente-clustered)."}
+b1 <- coef(m_preferred)["prox_main"]
+b3 <- coef(m_preferred)["prox_main:pct_single_hh"]
+
+singles_seq <- seq(
+  min(df$pct_single_hh, na.rm = TRUE),
+  max(df$pct_single_hh, na.rm = TRUE),
+  length.out = 200
+)
+
+# Delta-method SE: Var(β1 + β3*x) = Var(β1) + x²·Var(β3) + 2x·Cov(β1,β3)
+v     <- vcov(m_preferred)[c("prox_main", "prox_main:pct_single_hh"),
+                            c("prox_main", "prox_main:pct_single_hh")]
+me    <- b1 + b3 * singles_seq
+se_me <- sqrt(v[1,1] + singles_seq^2 * v[2,2] + 2 * singles_seq * v[1,2])
+
+me_df <- tibble(
+  singles = singles_seq,
+  me      = me,
+  lower   = me - 1.96 * se_me,
+  upper   = me + 1.96 * se_me
+)
+
+ggplot(me_df, aes(x = singles, y = me)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "grey80", alpha = 0.6) +
+  geom_line(colour = "#2E5D9E", linewidth = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40", linewidth = 0.8) +
+  annotate("text", x = max(singles_seq) * 0.85, y = 0.001,
+           label = "Zero effect", colour = "grey40", size = 3.2, vjust = -0.5) +
+  labs(
+    title    = "Marginal effect of school distance on log WOZ",
+    subtitle = "By single-person household share | 95% CI from delta method",
+    x        = "Single-person household share (%)",
+    y        = "ME of distance (km) on log WOZ"
+  )
+
+ggsave("output/figures/marginal_effects.png", width = 9, height = 5.5, dpi = 150)
+```
+The marginal effect declines as singles share rises, from ~0.047 at the low-singles end to ~0.015 at the high-singles tail. The blue line stays above zero throughout, but the lower bound of the 95% CI crosses zero around 75%+ singles share. The CI has a wedge/triangle shape, narrow on the left and widening dramatically to the right. This reflects the distribution of observations: most wijken cluster around 25–40% singles, where estimates are precise. Very few districts are above 75% singles, so uncertainty is large there and the interaction effect cannot be precisely identified. The declining slope is directionally consistent with H2 but statistically insignificant in this specification.
+
+## Tipping Point
+
+The tipping point is derived analytically from the condition ∂log_woz/∂prox_main = 0: pct_single_hh\* = −β₁/β₃. A 95% confidence interval is obtained via the delta method, using the gradient of the tipping point formula with respect to β₁ and β₃.
+
+```{r tipping-point}
+b1 <- coef(m_preferred)["prox_main"]
+b3 <- coef(m_preferred)["prox_main:pct_single_hh"]
+v  <- vcov(m_preferred)[c("prox_main", "prox_main:pct_single_hh"),
+                         c("prox_main", "prox_main:pct_single_hh")]
+
+tp <- -b1 / b3
+
+# Gradient: ∂(-β1/β3)/∂β1 = -1/β3,  ∂(-β1/β3)/∂β3 = β1/β3²
+grad  <- c(-1 / b3, b1 / b3^2)
+tp_se <- as.numeric(sqrt(t(grad) %*% v %*% grad))
+tp_ci <- tp + c(-1.96, 1.96) * tp_se
+
+cat("Tipping point estimate:   ", round(tp, 1), "% single-person households\n")
+cat("95% CI:                  [", round(tp_ci[1], 1), ",", round(tp_ci[2], 1), "]\n")
+cat("Sample median singles:    ", round(median(df$pct_single_hh, na.rm = TRUE), 1), "%\n")
+cat("Sample 75th percentile:   ", round(quantile(df$pct_single_hh, 0.75, na.rm = TRUE), 1), "%\n")
+cat("Tipping point exists:     ", !is.na(tp) && b1 * b3 < 0, "\n")
+```
+
+
+From Model B, β₁ (distance) is positive (+0.049) and β₃ (interaction) is slightly negative, so they have **opposite signs** — `Tipping point exists: TRUE`. Mathematically, a tipping point exists at **140.6%** singles share. However, this is far outside the feasible 0–100% range and therefore has no practical meaning — no Dutch district comes close to that demographic composition.
+
+The 95% CI of [−222, +504] is enormous because β₃ is extremely close to zero: dividing by a near-zero number amplifies uncertainty massively, and the CI spans both sides of zero and extends far beyond the feasible range in both directions.
+
+**The honest conclusion**: while the formula yields a mathematical solution, the tipping point is not identified within the observable data. School proximity is a consistent price discount across the full range of single-person household shares observed in the Netherlands. H3 is not supported in this specification. This motivates both the panel model — which uses stricter within-district identification — and the car ownership extension, where the conditional tipping point is identified at a realistic value (61%).
+
+## Panel Two-Way Fixed Effects Model
+
+The cross-sectional models absorb municipality-level unobservables but cannot rule out time-invariant *district*-level confounders. For example, a wijk that has always had many schools because it was built near a school, and also always had lower WOZ for unrelated reasons. The panel TWFE model addresses this by adding district fixed effects (αᵢ), which absorb all time-invariant characteristics of each wijk, and year fixed effects (γₜ), which absorb common annual shocks to the Dutch housing market (e.g. interest rate changes, national policy shifts). The identifying variation is purely within-district over time, changes in `dist_primary_school` and `pct_single_hh` within the same wijk between 2018 and 2023.
+
+```{r twfe-prep}
+panel_df <- readRDS("data/processed/cbs_panel.rds") %>%
+  filter(
+    !is.na(log_woz),
+    !is.na(dist_primary_school),
+    !is.na(pct_single_hh),
+    !is.na(income_avg_k),
+    pop_total > 500
+  )
+
+# ── Re-join Leefbaarometer scores (year-matched) ────────────────────────────
+year_map <- c("2018" = 2018, "2019" = 2018, "2020" = 2020,
+              "2021" = 2020, "2022" = 2022, "2023" = 2022)
+
+lbm_raw   <- read.csv("data/raw/leefbaarometer_wijken.csv",
+                       stringsAsFactors = FALSE, check.names = FALSE)
+lbm_clean <- lbm_raw[lbm_raw$jaar %in% c(2018, 2020, 2022),
+                      c("wk_code", "jaar", "lbm")]
+names(lbm_clean) <- c("wijk_code", "lbm_year", "lbm_score")
+
+panel_df <- panel_df %>%
+  select(-any_of(c("lbm_score", "lbm_year"))) %>%
+  mutate(lbm_year = as.integer(year_map[as.character(year)])) %>%
+  left_join(lbm_clean, by = c("wijk_code", "lbm_year")) %>%
+  select(-lbm_year)
+
+cat("Panel observations:", nrow(panel_df), "\n")
+cat("Districts:         ", n_distinct(panel_df$wijk_code), "\n")
+cat("Years:             ", paste(sort(unique(panel_df$year)), collapse = ", "), "\n")
+cat("lbm_score matched:", sum(!is.na(panel_df$lbm_score)), "/", nrow(panel_df), "\n")
+cat("delta_singles_lag1 available:", sum(!is.na(panel_df$delta_singles_lag1)), "\n")
+```
+
+The panel covers 2018–2023 (6 years) rather than the full 2016–2023 range because CBS did not include `dist_primary_school` in the 2016 and 2017 editions, those years are dropped by the `!is.na(dist_primary_school)` filter. Six years is still a solid panel for identifying within-district variation. The `delta_singles_lag1` coverage of ~91% is acceptable, the remaining 9% are districts without panel history back to 2016/2017. The Leefbaarometer match rate of ~95.5% is consistent with the cross-section. These figures should be reported in a data appendix or footnote in the thesis.
+
+```{r twfe-model}
+# TWFE: district FE (wijk_code) + year FE
+# Uses CBS-provided dist_primary_school, which varies by year as schools open/close
+# delta_singles_lag1 controls for pre-period demographic momentum
+
+# Model C — without pct_owner_occupied
+m_twfe <- feols(
+  log_woz ~ dist_primary_school * pct_single_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            delta_singles_lag1 + lbm_score | wijk_code + year,
+  data = panel_df,
+  vcov = ~wijk_code
+)
+
+# Model D — with pct_owner_occupied (consistent with cross-sectional Model B)
+m_twfe_D <- feols(
+  log_woz ~ dist_primary_school * pct_single_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            delta_singles_lag1 + pct_owner_occupied + lbm_score | wijk_code + year,
+  data = panel_df,
+  vcov = ~wijk_code
+)
+
+# SE comparison for the panel models
+key_terms_twfe <- c("dist_primary_school", "pct_single_hh",
+                    "dist_primary_school:pct_single_hh")
+
+se_compare_twfe <- data.frame(
+  Term      = key_terms_twfe,
+  SE_ModelC = se(m_twfe)[key_terms_twfe],
+  SE_ModelD = se(m_twfe_D)[key_terms_twfe]
+) %>%
+  mutate(Inflation_pct = round(100 * (SE_ModelD / SE_ModelC - 1), 1))
+
+print(se_compare_twfe)
+cat("\nAdj. R² Model C:", round(r2(m_twfe,   type = "ar2"), 4), "\n")
+cat("Adj. R² Model D:", round(r2(m_twfe_D, type = "ar2"), 4), "\n")
+```
+
+All three SEs decrease in Model D (−7.8%, −9.2%, −5.6%) and Adj. R² improves from 0.9844 to 0.9847. **Model D preferred again**, consistent with the cross-section. 
+
+## Full Results Table
+
+```{r twfe-table}
+twfe_tbl_args <- list(
+  models   = list("(B0) CS Controls" = mB0,
+                  "(A) CS Interaction" = mA,
+                  "(B) CS + Owner-occ." = mB,
+                  "(C) Panel TWFE" = m_twfe,
+                  "(D) Panel + Owner-occ." = m_twfe_D),
+  stars    = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  coef_map = c(
+    "prox_main"                         = "Distance to school (km)",
+    "dist_primary_school"               = "Distance to school (km)",
+    "pct_single_hh"                     = "Single-HH share (%)",
+    "cars_per_hh"             = "Cars per household",
+    "prox_main:pct_single_hh"           = "Distance × Single-HH share",
+    "dist_primary_school:pct_single_hh" = "Distance × Single-HH share",
+    "income_avg_k"                      = "Avg. household income (k€)",
+    "pct_employed"                      = "Employment rate (%)",
+    "pop_density_km2"                   = "Population density (per km²)",
+    "pct_age_0_14"                      = "Share aged 0–14 (%)",
+    "pct_owner_occupied"                = "Owner-occupied (%)",
+    "delta_singles_lag1"                = "ΔSingles share (lag 1)",
+    "lbm_score"                         = "Liveability score (Leefbaarometer)"
+  ),
+  gof_map  = c("nobs", "r.squared", "adj.r.squared"),
+  title    = "School proximity and log WOZ: cross-sectional and panel estimates",
+  notes    = "Models A–B: gemeente FE, clustered SEs at gemeente level (2023 cross-section). Model C: district + year FE, clustered SEs at district level (2018–2023 panel)."
+)
+
+# Display inline
+do.call(modelsummary, twfe_tbl_args)
+
+# Save to file
+do.call(modelsummary, c(twfe_tbl_args, list(output = "output/tables/full_results_table.html")))
+webshot2::webshot("output/tables/full_results_table.html", 
+                  "output/tables/full_results_table.png",
+                  zoom = 2)  # zoom = 2 for high resolution
+```
+The combined cross-section and panel table reveals four consistent findings across all specifications:
+
+**H1 (proximity premium) — Rejected.** The distance coefficient is positive and significant in the cross-section (0.049\*\*) and positive but insignificant in the panel (0.046–0.048). School proximity is a price discount in every specification.
+
+**H2/H3 (tipping point) — Not confirmed here.** The interaction `Distance × Single-HH share` is −0.000 or −0.001 in all four models — negative and near-zero, which is inconsistent with the positive β₃ predicted by H2 (the proximity premium was expected to weaken with more singles, implying β₃ > 0). The tipping point is only identified once car ownership is jointly modelled (Section 10).
+
+**Singles share — robustly negative.** `Single-HH share` is negative and significant across all models (−0.003 to −0.005, p < 0.01). Higher singles share independently lowers WOZ within municipalities and over time within districts.
+
+**Liveability score — dominant predictor.** In the cross-section (~1.1\*\*\*) and panel (~0.3\*\*\*), the Leefbaarometer score is the strongest predictor. The smaller panel coefficient reflects that district FEs absorb permanent liveability differences — the within-district coefficient captures the WOZ impact of liveability *changes* over time.
+
+Panel observations drop to ~14,350 from ~14,903 due to Leefbaarometer missingness (3.7% loss) — modest and acceptable. Model D is the preferred panel specification.
+
+---
+
+## Extension I: School Quality Split (Gibbons & Machin)
+
+Gibbons & Machin (2006) showed that only the top-performing schools generate a hedonic price premium. For all other schools, proximity is either neutral or a discount. To test whether this holds in the Dutch context, we replace the main distance variable with school-quality-specific distances: `dist_good_school_km` (distance to the nearest top-20% school) and `dist_std_school_km` (distance to the nearest standard school). If the G&M mechanism holds, the coefficient on `dist_good_school_km` should be smaller (or negative) compared to `dist_std_school_km`. Models E and F are otherwise identical to Model B.
+
+```{r school-quality-models}
+# ── Check whether quality distances are available in df ─────────────────────
+has_quality <- all(c("dist_good_school_km", "dist_std_school_km") %in% names(df))
+
+if (!has_quality) {
+  message("School quality distances not yet in df — re-run merge chunk after school-quality-distances.")
+} else {
+  # Model E — good schools (top 20%)
+  mE <- feols(
+    log_woz ~ dist_good_school_km * pct_single_hh +
+              income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+              pct_owner_occupied + lbm_score | gemeente_code,
+    data = df, vcov = ~gemeente_code
+  )
+
+  # Model F — standard schools (bottom 80%)
+  mF <- feols(
+    log_woz ~ dist_std_school_km * pct_single_hh +
+              income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+              pct_owner_occupied + lbm_score | gemeente_code,
+    data = df, vcov = ~gemeente_code
+  )
+
+  quality_tbl_args <- list(
+    models   = list("(E) Good schools (top 20%)" = mE,
+                    "(F) Standard schools (bottom 80%)" = mF),
+    stars    = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+    coef_map = c(
+      "dist_good_school_km"               = "Distance to school (km)",
+      "dist_std_school_km"                = "Distance to school (km)",
+      "pct_single_hh"                     = "Single-HH share (%)",
+      "dist_good_school_km:pct_single_hh" = "Distance × Single-HH share",
+      "dist_std_school_km:pct_single_hh"  = "Distance × Single-HH share",
+      "income_avg_k"                      = "Avg. household income (k€)",
+      "pct_employed"                      = "Employment rate (%)",
+      "pop_density_km2"                   = "Population density (per km²)",
+      "pct_age_0_14"                      = "Share aged 0–14 (%)",
+      "pct_owner_occupied"                = "Owner-occupied (%)",
+      "lbm_score"                         = "Liveability score (Leefbaarometer)"
+    ),
+    gof_map  = c("nobs", "r.squared", "adj.r.squared"),
+    title    = "School quality split: good vs standard schools (Gibbons & Machin robustness)",
+    notes    = "Good schools = top 20% by standardised doorstroomtoets score (DUO 2023-2024). Municipality FE, clustered SEs at gemeente level."
+  )
+
+  # Use fixest::etable() — avoids modelsummary/plyr round_any conflict
+  etable(mE, mF,
+         headers    = list("(E) Good schools (top 20%)" = 1,
+                           "(F) Standard schools (bottom 80%)" = 1),
+         signif.code = c("***" = 0.001, "**" = 0.01, "*" = 0.05),
+         notes      = "Good schools = top 20% by standardised doorstroomtoets score (DUO 2023-2024). Municipality FE, clustered SEs at gemeente level.")
+
+do.call(modelsummary, c(quality_tbl_args, list(output = "output/tables/ext1_quality_table.html")))
+
+  # Key coefficient summary
+  ct_E <- summary(mE)$coeftable
+  ct_F <- summary(mF)$coeftable
+  cat("\nGood school distance coef:",
+      round(ct_E["dist_good_school_km", "Estimate"], 4),
+      "(p =", round(ct_E["dist_good_school_km", "Pr(>|t|)"], 3), ")\n")
+  cat("Standard school distance coef:",
+      round(ct_F["dist_std_school_km", "Estimate"], 4),
+      "(p =", round(ct_F["dist_std_school_km", "Pr(>|t|)"], 3), ")\n")
+  cat("\nG&M prediction: good school coef NEGATIVE (premium), standard coef POSITIVE (discount)\n")
+}
+```
+```{r}
+webshot2::webshot("output/tables/ext1_quality_table.html",
+                  "output/tables/ext1_quality_table.png",
+                  zoom = 2)
+```
+Both distance coefficients are positive, neither school type generates an outright proximity premium at the wijk level. However, the magnitude difference is informative: good school distance (β ≈ 0.013, p < 0.01) is roughly half the standard school discount (β ≈ 0.024, p < 0.05). Proximity to a good school is penalised substantially less than proximity to a standard school, a finding directionally consistent with Gibbons & Machin even though an outright premium is not found.
+
+The absence of a negative coefficient for good schools reflects the wijk-level aggregation: at the district level, the nuisance effects of school traffic and noise affect all nearby residents regardless of school quality, while the quality premium only benefits families who select the school. G&M found their premium at the level of individual property transactions, a finer spatial resolution. The quality-split result should be reported as a partial confirmation of the G&M mechanism, not a refutation: *"the proximity discount is approximately half as large for top-20% schools (β = 0.013) as for standard schools (β = 0.024), consistent with the direction of Gibbons & Machin (2006)."*
+
+Note: a panel version of the quality split is not estimated because `dist_good_school_km` and `dist_std_school_km` are derived from a single 2023 DUO snapshot and do not vary over time, they would be absorbed by district fixed effects in a TWFE model.
+
+---
+
+## Extension II: Car Ownership as a Mobility Moderator
+
+**Motivation**
+
+The rejection of H1 raises a natural question: why is school proximity consistently a price discount rather than a premium? One candidate mechanism is car ownership. In the Netherlands, the open enrollment system (*vrije schoolkeuze*) means proximity to a school does not guarantee access, households can and do send children to any school regardless of distance. For households with a car, physical proximity to a school is therefore irrelevant as an access benefit, and the only remaining effect of having a school nearby is the externalities (noise, traffic, parking pressure). This predicts that the proximity discount should be weaker in high-car districts, households there care less about school distance in either direction.
+
+We test this by adding `cars_per_hh` (passenger cars per household, from CBS Kerncijfers) first as a plain control variable (Model G) — does the proximity coefficient change once car ownership is absorbed? — and then as a moderator (Model H) — does car ownership significantly moderate the proximity effect?
+
+This is an exploratory extension motivated by the empirical null result on H1, and should be framed as such in the thesis rather than as a pre-specified hypothesis.
+
+```{r cars-models}
+# ── Model G: cars_per_hh as additional control (based on preferred Model B) ──
+mG <- feols(
+  log_woz ~ prox_main * pct_single_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            pct_owner_occupied + lbm_score + cars_per_hh | gemeente_code,
+  data = df,
+  vcov = ~gemeente_code
+)
+
+# ── Model H: cars_per_hh as moderator of proximity effect ────────────────────
+mH <- feols(
+  log_woz ~ prox_main * pct_single_hh + prox_main * cars_per_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            pct_owner_occupied + lbm_score | gemeente_code,
+  data = df,
+  vcov = ~gemeente_code
+)
+
+# ── Compare key coefficients across B, G, H ──────────────────────────────────
+etable(mB, mG, mH,
+       headers    = list("(B) Baseline interaction" = 1,
+                         "(G) + Cars control"       = 1,
+                         "(H) + Cars interaction"   = 1),
+       keep       = c("prox_main", "pct_single_hh",
+                      "prox_main:pct_single_hh",
+                      "cars_per_hh",
+                      "prox_main:cars_per_hh"),
+       signif.code = c("***" = 0.001, "**" = 0.01, "*" = 0.05),
+       notes = "Municipality FE, SEs clustered at gemeente level. Showing key coefficients only.")
+
+cat("\nWithin-gemeente correlation: pct_single_hh vs cars_per_hh =",
+    round(cor(
+      df$pct_single_hh - ave(df$pct_single_hh, df$gemeente_code),
+      df$cars_per_hh   - ave(df$cars_per_hh,   df$gemeente_code),
+      use = "complete.obs"
+    ), 3), "\n")
+```
+
+```{r cars-tipping-point}
+# Conditional tipping point from Model H: cars_per_hh* = (-β1 - β3_singles*s̄) / β3_cars
+# Evaluated at mean singles share — consistent with Table A6 formula
+# ME = β1 + β3_singles*singles + β3_cars*cars = 0  →  solve for cars at singles = s̄
+
+b1_h       <- coef(mH)["prox_main"]
+b3_singles <- coef(mH)["prox_main:pct_single_hh"]
+b3_cars    <- coef(mH)["prox_main:cars_per_hh"]
+singles_mean <- mean(df$pct_single_hh, na.rm = TRUE)
+
+v_h <- vcov(mH)[c("prox_main", "prox_main:pct_single_hh", "prox_main:cars_per_hh"),
+                 c("prox_main", "prox_main:pct_single_hh", "prox_main:cars_per_hh")]
+
+tp_h <- (-b1_h - b3_singles * singles_mean) / b3_cars
+
+# Delta-method SE w.r.t. [β1, β3_singles, β3_cars]:
+#   ∂tp/∂β1         = -1 / β3_cars
+#   ∂tp/∂β3_singles = -s̄ / β3_cars
+#   ∂tp/∂β3_cars    = (β1 + β3_singles*s̄) / β3_cars²
+grad_h  <- c(-1 / b3_cars,
+             -singles_mean / b3_cars,
+             (b1_h + b3_singles * singles_mean) / b3_cars^2)
+tp_h_se <- as.numeric(sqrt(t(grad_h) %*% v_h %*% grad_h))
+tp_h_ci <- tp_h + c(-1.96, 1.96) * tp_h_se
+
+cat("Model H — conditional tipping point (cars_per_hh*, at mean singles =",
+    round(singles_mean, 1), "%):\n")
+cat("Estimate:          ", round(tp_h, 3), "cars per household\n")
+cat("95% CI:           [", round(tp_h_ci[1], 3), ",", round(tp_h_ci[2], 3), "]\n")
+cat("Sample max cars:   ", round(max(df$cars_per_hh, na.rm = TRUE), 3), "\n")
+cat("Sample 95th pct:   ", round(quantile(df$cars_per_hh, 0.95, na.rm = TRUE), 3), "\n")
+cat("Tipping point within data range:", tp_h > 0 & tp_h < max(df$cars_per_hh, na.rm = TRUE), "\n")
+```
+
+```{r singles-tipping-point-modelH}
+# In Model H, ME = β1 + β3_singles*singles + β3_cars*cars = 0
+# Solving for singles*: singles* = (-β1 - β3_cars*cars_mean) / β3_singles
+# Evaluated at mean and at selected cars_per_hh values
+
+b1_H       <- coef(mH)["prox_main"]
+b3_singles <- coef(mH)["prox_main:pct_single_hh"]
+b3_cars    <- coef(mH)["prox_main:cars_per_hh"]
+cars_mean  <- mean(df$cars_per_hh, na.rm = TRUE)
+cars_med   <- median(df$cars_per_hh, na.rm = TRUE)
+
+tp_singles_mean   <- (-b1_H - b3_cars * cars_mean)  / b3_singles
+tp_singles_median <- (-b1_H - b3_cars * cars_med)   / b3_singles
+
+# Delta-method SE at mean cars_per_hh
+# tp = (-β1 - β3_cars*c) / β3_singles
+# Gradient w.r.t. [β1, β3_singles, β3_cars]:
+#   ∂tp/∂β1         = -1 / β3_singles
+#   ∂tp/∂β3_singles = (β1 + β3_cars*c) / β3_singles²
+#   ∂tp/∂β3_cars    = -c / β3_singles
+v_H   <- vcov(mH)[c("prox_main", "prox_main:pct_single_hh", "prox_main:cars_per_hh"),
+                   c("prox_main", "prox_main:pct_single_hh", "prox_main:cars_per_hh")]
+c_val <- cars_mean
+grad  <- c(
+  -1 / b3_singles,
+  (b1_H + b3_cars * c_val) / b3_singles^2,
+  -c_val / b3_singles
+)
+tp_se <- as.numeric(sqrt(t(grad) %*% v_H %*% grad))
+tp_ci <- tp_singles_mean + c(-1.96, 1.96) * tp_se
+
+cat("Model H — singles tipping point (evaluated at mean cars_per_hh =",
+    round(cars_mean, 2), "):\n")
+cat("Estimate:                 ", round(tp_singles_mean, 1), "% single-HH share\n")
+cat("95% CI:                  [", round(tp_ci[1], 1), ",", round(tp_ci[2], 1), "]\n")
+cat("At median cars (", round(cars_med, 2), "):", round(tp_singles_median, 1), "%\n")
+cat("Sample max singles:       ", round(max(df$pct_single_hh, na.rm = TRUE), 1), "%\n")
+cat("Sample 95th pct singles:  ", round(quantile(df$pct_single_hh, 0.95, na.rm = TRUE), 1), "%\n")
+cat("Within data range:        ", tp_singles_mean > 0 & tp_singles_mean < 100, "\n")
+```
+
+Two conditional tipping points are computed from Model H, each evaluated at the sample mean of the other moderator. The **conditional car ownership tipping point** (cars_per_hh\*) is the car ownership level at which the proximity discount disappears, evaluated at mean singles share (~34.3%). The **conditional singles tipping point** (pct_single_hh\*) is the singles share at which the proximity effect crosses zero, evaluated at mean car ownership (~1.17 cars/HH). Both use the delta method for confidence intervals and are directly comparable to the values reported in Table A6.
+
+**Conditional cars tipping point (cars_per_hh\*):** evaluated at mean singles share (34.3%), the tipping point is **1.716 cars per household** (95% CI: 1.503–1.930). This is inside the observable data range (sample max 2.40, 95th percentile 1.60), meaning the flip from discount to neutrality genuinely occurs within Dutch data. The entire CI falls below the sample maximum and the lower bound (1.503) is within the top 5% of the distribution, making this a precisely identified and empirically credible threshold.
+
+**Conditional singles tipping point (pct_single_hh\*):** evaluated at mean car ownership (1.17 cars/HH), the tipping point is **60.9%** (95% CI: 41–81%). This is inside the observable range (sample max 98%, 95th percentile 58%), meaning the flip from discount to premium genuinely occurs within Dutch data. The CI is entirely within 0–100%, a credible, precisely identified result. At median car ownership (1.20 cars/HH) the estimate is virtually identical (59.6%).
+
+**Important caveat:** because Model H contains two interaction terms simultaneously, both tipping points are conditional, each threshold assumes the other moderator is held at its sample mean. Neither is a universal threshold; both are joint functions of demographics and mobility. This should be stated clearly in the thesis.
+
+```{r fig-marginal-effects-modelH, fig.cap="Marginal effect of school distance on log WOZ by single-HH share and car ownership level. Shaded bands: 95% CI (gemeente-clustered)."}
+library(ggplot2)
+
+b1_H       <- coef(mH)["prox_main"]
+b3_singles <- coef(mH)["prox_main:pct_single_hh"]
+b3_cars    <- coef(mH)["prox_main:cars_per_hh"]
+v_H        <- vcov(mH)[c("prox_main", "prox_main:pct_single_hh", "prox_main:cars_per_hh"),
+                        c("prox_main", "prox_main:pct_single_hh", "prox_main:cars_per_hh")]
+
+# Three representative car ownership levels (p10, mean, p90 for visible spread)
+cars_levels <- c(
+  "Low (p10)"    = unname(quantile(df$cars_per_hh, 0.10, na.rm = TRUE)),
+  "Mean"         = unname(mean(df$cars_per_hh, na.rm = TRUE)),
+  "High (p90)"   = unname(quantile(df$cars_per_hh, 0.90, na.rm = TRUE))
+)
+
+singles_seq <- seq(min(df$pct_single_hh, na.rm = TRUE),
+                   max(df$pct_single_hh, na.rm = TRUE),
+                   length.out = 200)
+
+# Build data frame for all combinations
+me_df <- do.call(rbind, lapply(names(cars_levels), function(lbl) {
+  c_val <- cars_levels[lbl]
+  me    <- b1_H + b3_singles * singles_seq + b3_cars * c_val
+
+  # Delta-method SE: Var(β1 + β3s*s + β3c*c)
+  # Gradient w.r.t. [β1, β3_singles, β3_cars] = [1, s, c]
+  se_me <- sapply(singles_seq, function(s) {
+    g <- c(1, s, c_val)
+    sqrt(as.numeric(t(g) %*% v_H %*% g))
+  })
+
+  data.frame(
+    singles     = singles_seq,
+    me          = me,
+    lower       = me - 1.96 * se_me,
+    upper       = me + 1.96 * se_me,
+    cars_label  = lbl
+  )
+}))
+
+me_df$cars_label <- factor(me_df$cars_label,
+                            levels = c("Low (p10)", "Mean", "High (p90)"))
+
+# Tipping points per car level (for vertical lines)
+tp_df <- data.frame(
+  cars_label = names(cars_levels),
+  tp         = as.numeric((-b1_H - b3_cars * cars_levels) / b3_singles)
+)
+tp_df <- tp_df[tp_df$tp > 0 & tp_df$tp < 100, ]
+tp_df$cars_label <- factor(tp_df$cars_label, levels = c("Low (p10)", "Mean", "High (p90)"))
+
+ggplot(me_df, aes(x = singles, y = me,
+                  colour = cars_label, fill = cars_label)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.12, colour = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40", linewidth = 0.8) +
+  geom_vline(data = tp_df,
+             aes(xintercept = tp, colour = cars_label),
+             linetype = "dotted", linewidth = 0.8) +
+  scale_colour_manual(
+    values = c("Low (p10)" = "#1E7B4B", "Mean" = "#2E5D9E", "High (p90)" = "#C0392B"),
+    name   = "Cars per household"
+  ) +
+  scale_fill_manual(
+    values = c("Low (p10)" = "#1E7B4B", "Mean" = "#2E5D9E", "High (p90)" = "#C0392B"),
+    name   = "Cars per household"
+  ) +
+  labs(
+    title    = "Marginal effect of school distance on log WOZ",
+    subtitle = "By single-HH share and car ownership level (Model H) | 95% CI | dotted lines = tipping points",
+    x        = "Single-person household share (%)",
+    y        = "ME of distance (km) on log WOZ"
+  )
+
+ggsave("output/figures/marginal_effects_modelH.png", width = 9, height = 5.5, dpi = 150)
+```
+
+The plot shows three lines corresponding to low (p10), mean, and high (p90) car ownership levels. Each line shows the marginal effect of school distance on log WOZ as a function of singles share, with 95% CI bands. Dotted vertical lines mark where each line crosses zero, the tipping point for that car ownership level.
+
+All three lines have a negative slope (discount weakens as singles rise) and all cross zero within the observable data range. **Red (high car ownership, p90)** starts low (~0.06) and crosses zero earliest at ~42% singles. **Blue (mean car ownership)** crosses zero at ~61%. **Green (low car ownership, p10)** starts highest (~0.13) and crosses zero latest at ~81% singles.
+
+The pattern is theoretically coherent: in high-car districts, proximity already matters less (lower starting discount), so a smaller demographic shift is enough to push the effect to zero. In low-car districts, the discount is larger but demographic composition needs to be more extreme to overcome it. The plot directly demonstrates why simpler models (A–D) found no tipping point — averaging across car ownership levels masks this heterogeneity.
+
+```{r cars-twfe-models}
+# ── Model I: TWFE + cars_per_hh as control (extends Model D) ─────────────────
+m_twfe_I <- feols(
+  log_woz ~ dist_primary_school * pct_single_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            delta_singles_lag1 + pct_owner_occupied + lbm_score +
+            cars_per_hh | wijk_code + year,
+  data = panel_df,
+  vcov = ~wijk_code
+)
+
+# ── Model J: TWFE + cars_per_hh as moderator ─────────────────────────────────
+m_twfe_J <- feols(
+  log_woz ~ dist_primary_school * pct_single_hh +
+            dist_primary_school * cars_per_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            delta_singles_lag1 + pct_owner_occupied + lbm_score | wijk_code + year,
+  data = panel_df,
+  vcov = ~wijk_code
+)
+
+etable(m_twfe_D, m_twfe_I, m_twfe_J,
+       headers     = list("(D) TWFE baseline" = 1,
+                          "(I) + Cars control" = 1,
+                          "(J) + Cars interaction" = 1),
+       keep        = c("dist_primary_school", "pct_single_hh",
+                       "dist_primary_school:pct_single_hh",
+                       "cars_per_hh",
+                       "dist_primary_school:cars_per_hh"),
+       signif.code = c("***" = 0.001, "**" = 0.01, "*" = 0.05),
+       notes       = "District + year FE, SEs clustered at district level. Key coefficients only.")
+
+cat("\nWithin-district correlation: pct_single_hh vs cars_per_hh =",
+    round(cor(
+      panel_df$pct_single_hh - ave(panel_df$pct_single_hh, panel_df$wijk_code),
+      panel_df$cars_per_hh   - ave(panel_df$cars_per_hh,   panel_df$wijk_code),
+      use = "complete.obs"
+    ), 3), "\n")
+
+# Save Extension 2 table as HTML + PNG (moved here so m_twfe_I and m_twfe_J exist)
+ext2_tbl_args <- list(
+  models   = list("(G) Cars control (CS)"       = mG,
+                  "(H) Cars interaction (CS)"   = mH,
+                  "(I) Cars control (Panel)"    = m_twfe_I,
+                  "(J) Cars interaction (Panel)"= m_twfe_J),
+  stars    = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  coef_map = c(
+    "prox_main"                         = "Distance to school (km)",
+    "dist_primary_school"               = "Distance to school (km)",
+    "pct_single_hh"                     = "Single-HH share (%)",
+    "prox_main:pct_single_hh"           = "Distance × Single-HH share",
+    "dist_primary_school:pct_single_hh" = "Distance × Single-HH share",
+    "cars_per_hh"                       = "Cars per household",
+    "prox_main:cars_per_hh"             = "Distance × Cars/HH",
+    "dist_primary_school:cars_per_hh"   = "Distance × Cars/HH",
+    "income_avg_k"                      = "Avg. household income (k€)",
+    "pct_employed"                      = "Employment rate (%)",
+    "pop_density_km2"                   = "Population density (per km²)",
+    "pct_age_0_14"                      = "Share aged 0–14 (%)",
+    "pct_owner_occupied"                = "Owner-occupied (%)",
+    "delta_singles_lag1"                = "ΔSingles share (lag 1)",
+    "lbm_score"                         = "Liveability score (Leefbaarometer)"
+  ),
+  gof_map  = c("nobs", "r.squared", "adj.r.squared"),
+  title    = "Extension 2: car ownership as mobility moderator",
+  notes    = "Models G–H: municipality FE, clustered SEs at gemeente level (2023 cross-section). Models I–J: district + year FE, clustered SEs at district level (2018–2023 panel)."
+)
+
+do.call(modelsummary, c(ext2_tbl_args, list(output = "output/tables/ext2_cars_table.html")))
+webshot2::webshot("output/tables/ext2_cars_table.html",
+                  "output/tables/ext2_cars_table.png",
+                  zoom = 2)
+```
+
+Models I and J are the panel equivalents of G and H, they add car ownership to the TWFE specification to test whether the cross-sectional car ownership finding survives the stricter within-district identification.
+
+**Model I (cars as control):** the proximity coefficient barely changes (0.046 → 0.044). Car ownership does not absorb the proximity discount in the panel either. `cars_per_hh` is positive and significant (+0.053\*): within districts over time, gaining more cars is associated with higher WOZ, even after absorbing permanent district characteristics.
+
+**Model J (cars as moderator):** `dist_primary_school × cars_per_hh` is −0.044 (p = 0.19) — not significant. The car ownership interaction does not survive the panel test. The within-district correlation between `pct_single_hh` and `cars_per_hh` is only −0.354 (much lower than the cross-sectional −0.741), so multicollinearity is not the reason. The most likely explanation is that Dutch car ownership changes very slowly within districts over 6 years, the panel simply lacks sufficient within-district variation in car ownership to identify the interaction effect. Car ownership is a slow-moving structural characteristic, and the cross-sectional finding from Model H should be interpreted as a structural relationship across districts rather than a causal within-district effect.
+
+---
+
+# Full Results Table (Paper-Ready)
+
+This section produces the consolidated regression table covering all ten specifications (Models A–J), formatted for direct inclusion in the paper. The table groups models into five blocks: cross-sectional main results (A–B), panel TWFE (C–D), school quality extension (E–F), car ownership cross-section (G–H), and car ownership panel (I–J). Fixed effect structure and sample are indicated via custom rows and the footnote.
+
+The table uses `modelsummary` with `kableExtra` for HTML rendering. All distance variables from different models are mapped to the same label ("Distance to school") so rows align across model types. The `plyr`/`modelsummary` namespace conflict is resolved by detaching `plyr` if loaded.
+
+```{r full-table-prep, include=FALSE}
+# ── Ensure all model objects exist before building the full table ─────────────
+# mE and mF are created inside an if(has_quality) block in school-quality-models.
+# If that block was skipped (e.g. dist_good_school_km not yet in df), recreate them here.
+
+if (!exists("mE") || !exists("mF")) {
+  # Try to load quality distances from spatial_vars.rds and merge onto df
+  if (file.exists("data/processed/spatial_vars.rds")) {
+    sv <- readRDS("data/processed/spatial_vars.rds")
+    if (all(c("dist_good_school_km", "dist_std_school_km") %in% names(sv))) {
+      df <- df %>%
+        select(-any_of(c("dist_good_school_km", "dist_std_school_km"))) %>%
+        left_join(sv %>% select(wijk_code, dist_good_school_km, dist_std_school_km),
+                  by = "wijk_code")
+      message("Quality distances loaded from spatial_vars.rds for table prep.")
+    }
+  }
+
+  # Only estimate if columns are now available in df
+  if (all(c("dist_good_school_km", "dist_std_school_km") %in% names(df))) {
+    mE <- feols(
+      log_woz ~ dist_good_school_km * pct_single_hh +
+                income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+                pct_owner_occupied + lbm_score | gemeente_code,
+      data = df, vcov = ~gemeente_code
+    )
+    mF <- feols(
+      log_woz ~ dist_std_school_km * pct_single_hh +
+                income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+                pct_owner_occupied + lbm_score | gemeente_code,
+      data = df, vcov = ~gemeente_code
+    )
+    message("mE and mF recreated in full-table-prep.")
+  } else {
+    stop("dist_good_school_km not available in df. Re-run the school-quality-distances chunk to rebuild spatial_vars.rds, then knit again.")
+  }
+}
+
+# Ensure car ownership models exist
+if (!exists("mG")) {
+  mG <- feols(
+    log_woz ~ prox_main * pct_single_hh +
+              income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+              pct_owner_occupied + lbm_score + cars_per_hh | gemeente_code,
+    data = df, vcov = ~gemeente_code
+  )
+}
+
+if (!exists("mH")) {
+  mH <- feols(
+    log_woz ~ prox_main * pct_single_hh + prox_main * cars_per_hh +
+              income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+              pct_owner_occupied + lbm_score | gemeente_code,
+    data = df, vcov = ~gemeente_code
+  )
+}
+
+if (!exists("m_twfe_I")) {
+  m_twfe_I <- feols(
+    log_woz ~ dist_primary_school * pct_single_hh +
+              income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+              delta_singles_lag1 + pct_owner_occupied + lbm_score +
+              cars_per_hh | wijk_code + year,
+    data = panel_df, vcov = ~wijk_code
+  )
+}
+
+if (!exists("m_twfe_J")) {
+  m_twfe_J <- feols(
+    log_woz ~ dist_primary_school * pct_single_hh +
+              dist_primary_school * cars_per_hh +
+              income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+              delta_singles_lag1 + pct_owner_occupied + lbm_score | wijk_code + year,
+    data = panel_df, vcov = ~wijk_code
+  )
+}
+```
+
+
+```{r full-table-paper, results='asis'}
+# ── Resolve modelsummary / plyr conflict ────────────────────────────────────
+if ("plyr" %in% loadedNamespaces()) {
+  try(detach("package:plyr", unload = TRUE, force = TRUE), silent = TRUE)
+}
+library(modelsummary)
+library(kableExtra)
+
+# ── Shared coefficient name map ───────────────────────────────────────────────
+coef_labels <- c(
+  "prox_main"                         = "Distance to school (km)",
+  "dist_primary_school"               = "Distance to school (km)",
+  "dist_good_school_km"               = "Distance to school (km)",
+  "dist_std_school_km"                = "Distance to school (km)",
+  "pct_single_hh"                     = "Single-HH share (%)",
+  "prox_main:pct_single_hh"           = "Distance &times; Single-HH share",
+  "dist_primary_school:pct_single_hh" = "Distance &times; Single-HH share",
+  "dist_good_school_km:pct_single_hh" = "Distance &times; Single-HH share",
+  "dist_std_school_km:pct_single_hh"  = "Distance &times; Single-HH share",
+  "cars_per_hh"                       = "Cars per household",
+  "prox_main:cars_per_hh"             = "Distance &times; Cars/HH",
+  "dist_primary_school:cars_per_hh"   = "Distance &times; Cars/HH",
+  "income_avg_k"                      = "Avg. household income (k&euro;)",
+  "pct_employed"                      = "Employment rate (%)",
+  "pop_density_km2"                   = "Population density (per km&sup2;)",
+  "pct_age_0_14"                      = "Share aged 0-14 (%)",
+  "pct_owner_occupied"                = "Owner-occupied (%)",
+  "delta_singles_lag1"                = "&Delta;Singles share (lag 1)",
+  "lbm_score"                         = "Liveability score"
+)
+
+# ── Shared GOF map ────────────────────────────────────────────────────────────
+gof_labels <- data.frame(
+  raw   = c("nobs",         "adj.r.squared"),
+  clean = c("Observations", "Adj. R²"),
+  fmt   = c(0,              3),
+  stringsAsFactors = FALSE
+)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TABLE 1 — Main results: cross-section (B0, A, B) + panel TWFE (C, D)
+# ═══════════════════════════════════════════════════════════════════════════════
+fe_rows_t1 <- data.frame(
+  term             = c("Municipality FE", "District FE", "Year FE"),
+  `(B0)`           = c("Yes", "No",  "No"),
+  `(A)`            = c("Yes", "No",  "No"),
+  `(B)`            = c("Yes", "No",  "No"),
+  `(C)`            = c("No",  "Yes", "Yes"),
+  `(D)`            = c("No",  "Yes", "Yes"),
+  check.names      = FALSE,
+  stringsAsFactors = FALSE
+)
+attr(fe_rows_t1, "position") <- c(23, 24, 25)
+
+tbl1 <- modelsummary(
+  models   = list(
+    "(B0)" = mB0,
+    "(A)"  = mA,
+    "(B)"  = mB,
+    "(C)"  = m_twfe,
+    "(D)"  = m_twfe_D
+  ),
+  coef_map = coef_labels,
+  gof_map  = gof_labels,
+  add_rows = fe_rows_t1,
+  stars    = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  fmt      = 3,
+  escape   = FALSE,
+  output   = "kableExtra",
+  title    = "Table A1. Main results: school proximity and log WOZ values"
+) %>%
+  add_header_above(
+    c(" "                      = 1,
+      "Cross-section (2023)"   = 3,
+      "Panel TWFE (2018–2023)" = 2)
+  ) %>%
+  add_footnote(
+    label    = "Dependent variable: log average WOZ value per district. Models B0–B: municipality (gemeente) fixed effects, SEs clustered at gemeente level. Models C–D: district and year fixed effects, SEs clustered at district level. B0 includes singles share and cars per HH as plain controls (no interaction). The Distance × Single-HH share coefficient in Models A and B is −0.0003 and −0.0004 respectively; both round to −0.000 at three decimal places. * p < 0.05, ** p < 0.01, *** p < 0.001.",
+    notation = "none"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "condensed"),
+    full_width        = FALSE,
+    font_size         = 13,
+    html_font         = "Times New Roman, Times, serif"
+  ) %>%
+  column_spec(4, border_right = TRUE)
+
+tbl1 %>% save_kable("output/tables/table1_main_results.html", self_contained = TRUE)
+webshot2::webshot("output/tables/table1_main_results.html",
+                  "output/figures/table1_main_results.png", zoom = 2)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TABLE 2 — Extensions: school quality (E, F) + car ownership (G, H, I, J)
+# ═══════════════════════════════════════════════════════════════════════════════
+fe_rows_t2 <- data.frame(
+  term             = c("Municipality FE", "District FE", "Year FE"),
+  `(E)`            = c("Yes", "No",  "No"),
+  `(F)`            = c("Yes", "No",  "No"),
+  `(G)`            = c("Yes", "No",  "No"),
+  `(H)`            = c("Yes", "No",  "No"),
+  `(I)`            = c("No",  "Yes", "Yes"),
+  `(J)`            = c("No",  "Yes", "Yes"),
+  check.names      = FALSE,
+  stringsAsFactors = FALSE
+)
+attr(fe_rows_t2, "position") <- c(25, 26, 27)
+
+tbl2 <- modelsummary(
+  models   = list(
+    "(E)"  = mE,
+    "(F)"  = mF,
+    "(G)"  = mG,
+    "(H)"  = mH,
+    "(I)"  = m_twfe_I,
+    "(J)"  = m_twfe_J
+  ),
+  coef_map = coef_labels,
+  gof_map  = gof_labels,
+  add_rows = fe_rows_t2,
+  stars    = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  fmt      = 3,
+  escape   = FALSE,
+  output   = "kableExtra",
+  title    = "Table A2. Extensions: school quality split and car ownership"
+) %>%
+  add_header_above(
+    c(" "                              = 1,
+      "Good schools\n(top 20%)"        = 1,
+      "Standard schools\n(bot. 80%)"   = 1,
+      "Cars control"                   = 1,
+      "Cars interaction"               = 1,
+      "Cars control"                   = 1,
+      "Cars interaction"               = 1)
+  ) %>%
+  add_header_above(
+    c(" "                    = 1,
+      "School quality (2023)"= 2,
+      "Car ownership CS"     = 2,
+      "Car ownership panel"  = 2)
+  ) %>%
+  add_footnote(
+    label    = "Dependent variable: log average WOZ value per district. Models E–H: municipality (gemeente) fixed effects, SEs clustered at gemeente level. Models I–J: district and year fixed effects, SEs clustered at district level. Good schools = top 20% by standardised doorstroomtoets score (DUO 2023–2024). Cars per household from CBS Kerncijfers. Note: Model H introduces a second interaction term (Distance × Cars/HH), which shifts the singles interaction tipping point relative to the unconditional models (A–D) where no car-ownership moderator is present — the zero-crossing of the marginal distance effect only emerges once car mobility is jointly modelled. The Distance × Single-HH share coefficient in Models E, F, and G is −0.0004, −0.0004, and −0.0004 respectively; all round to −0.000 at three decimal places. * p < 0.05, ** p < 0.01, *** p < 0.001.",
+    notation = "none"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "condensed"),
+    full_width        = FALSE,
+    font_size         = 13,
+    html_font         = "Times New Roman, Times, serif"
+  ) %>%
+  column_spec(3, border_right = TRUE) %>%
+  column_spec(5, border_right = TRUE)
+
+tbl2 %>% save_kable("output/tables/table2_extensions.html", self_contained = TRUE)
+webshot2::webshot("output/tables/table2_extensions.html",
+                  "output/figures/table2_extensions.png", zoom = 2)
+
+# ── Reference table: all models side by side (internal use, not for paper) ───
+fe_rows_all <- data.frame(
+  term    = c("Municipality FE", "District FE", "Year FE"),
+  `(B0)`  = c("Yes", "No",  "No"),
+  `(A)`   = c("Yes", "No",  "No"),
+  `(B)`   = c("Yes", "No",  "No"),
+  `(C)`   = c("No",  "Yes", "Yes"),
+  `(D)`   = c("No",  "Yes", "Yes"),
+  `(E)`   = c("Yes", "No",  "No"),
+  `(F)`   = c("Yes", "No",  "No"),
+  `(G)`   = c("Yes", "No",  "No"),
+  `(H)`   = c("Yes", "No",  "No"),
+  `(I)`   = c("No",  "Yes", "Yes"),
+  `(J)`   = c("No",  "Yes", "Yes"),
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+
+modelsummary(
+  models   = list(
+    "(B0)" = mB0, "(A)" = mA, "(B)" = mB, "(C)" = m_twfe, "(D)" = m_twfe_D,
+    "(E)"  = mE,  "(F)" = mF, "(G)" = mG, "(H)" = mH,
+    "(I)"  = m_twfe_I, "(J)" = m_twfe_J
+  ),
+  coef_map = coef_labels,
+  gof_map  = gof_labels,
+  add_rows = fe_rows_all,
+  stars    = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  fmt      = 3,
+  escape   = FALSE,
+  output   = "output/tables/full_results_all_models.html",
+  title    = "All models B0–J: reference table (not for paper)"
+)
+message("Reference table saved to output/tables/full_results_all_models.html")
+```
+
+**Why no TWFE model with control for school quality?**
+
+Models E–F use a 2023 cross-section because school quality distances are derived from a single DUO snapshot; a panel extension would require year-by-year school geocoding and is left for future work.
+
+The full structure of the analysis is: cross-sectional Models A/B and panel Models C/D as the **main results** testing H1–H3; Models E/F (school quality split) and Models G–J (car ownership) as **extensions** introducing new theoretical mechanisms; and the robustness checks in the following section validating the main results across alternative samples and proximity operationalisations.
+
+---
+
+# Robustness Checks
+
+Three robustness checks are applied to both the preferred cross-sectional specification (Model B) and the car ownership interaction model (Model H), which contains the main new finding. For each check the key coefficients are reported in a compact summary table.
+
+The four checks are:
+
+1. **Alternative proximity measure (sensitivity)** — replace `prox_main` (CBS-reported average distance) with `dist_school_centroid_km` (centroid-to-nearest-school distance computed via DUO spatial join). Because the two measures correlate only at r = 0.576, differences in results reflect the conceptual gap between address-based and centroid-based distance rather than model fragility, this check is therefore labelled a sensitivity check rather than a strict robustness check.
+2. **Stricter population threshold** — raise the minimum population from 500 to 1,000 residents, dropping smaller districts whose WOZ averages are less reliable.
+3. **Excluding the four largest cities** — drop Amsterdam (GM0363), Rotterdam (GM0599), Den Haag (GM0518), and Utrecht (GM0344), which dominate the high-singles tail and could be driving the interaction results.
+4. **Alternative proximity operationalisation (density)** — replace the distance variable with `n_schools_1km`, the number of primary schools within 1 km of the wijk centroid. The 1 km radius is chosen because it is close to the mean CBS distance (~0.91 km). Note the expected sign reversal: a negative coefficient on `n_schools_1km` is the density-model equivalent of a positive distance coefficient (both indicate a proximity discount).
+
+```{r robustness-setup}
+# ── Shared formula components ─────────────────────────────────────────────────
+controls_B <- "income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+               pct_owner_occupied + lbm_score"
+
+controls_H <- "income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+               pct_owner_occupied + lbm_score"
+
+big4 <- c("GM0363", "GM0599", "GM0518", "GM0344")  # Amsterdam, Rotterdam, Den Haag, Utrecht
+
+# ── Sample variants ───────────────────────────────────────────────────────────
+df_pop1000  <- df %>% filter(pop_total > 1000)
+df_nobig4   <- df %>% filter(!gemeente_code %in% big4)
+```
+
+```{r robustness-modelB}
+# ── Model B: baseline (already estimated, repeated here for reference) ────────
+# mB — main sample, CBS distance, pop > 500
+
+# B-rob1: centroid distance instead of CBS distance
+mB_rob1 <- feols(
+  log_woz ~ dist_school_centroid_km * pct_single_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            pct_owner_occupied + lbm_score | gemeente_code,
+  data = df,
+  vcov = ~gemeente_code
+)
+
+# B-rob2: pop > 1000
+mB_rob2 <- feols(
+  log_woz ~ prox_main * pct_single_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            pct_owner_occupied + lbm_score | gemeente_code,
+  data = df_pop1000,
+  vcov = ~gemeente_code
+)
+
+# B-rob3: exclude big 4 cities
+mB_rob3 <- feols(
+  log_woz ~ prox_main * pct_single_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            pct_owner_occupied + lbm_score | gemeente_code,
+  data = df_nobig4,
+  vcov = ~gemeente_code
+)
+
+# B-dens: school density within 1km (alternative proximity operationalisation)
+mB_dens <- feols(
+  log_woz ~ n_schools_1km * pct_single_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            pct_owner_occupied + lbm_score | gemeente_code,
+  data = df,
+  vcov = ~gemeente_code
+)
+
+etable(mB, mB_rob1, mB_rob2, mB_rob3, mB_dens,
+       headers     = list("(B) Baseline"       = 1,
+                          "(B-r1) Centroid"    = 1,
+                          "(B-r2) Pop > 1000"  = 1,
+                          "(B-r3) No big 4"    = 1,
+                          "(B-dens) Density"   = 1),
+       keep        = c("prox_main", "dist_school_centroid_km", "n_schools_1km",
+                       "pct_single_hh",
+                       "prox_main:pct_single_hh",
+                       "dist_school_centroid_km:pct_single_hh",
+                       "n_schools_1km:pct_single_hh"),
+       signif.code = c("***" = 0.001, "**" = 0.01, "*" = 0.05),
+       notes       = "Municipality FE, SEs clustered at gemeente level. Key coefficients only. B-dens uses school count within 1km — sign reversal expected.")
+```
+
+The Model B robustness results are reassuring across all four checks:
+
+**B-r1 (Centroid distance — sensitivity check):** `dist_school_centroid_km` is positive and significant (0.028\*), same direction as the CBS measure. The interaction with singles is −0.0003, same sign but smaller. Note that the correlation between the two distance measures is only r = 0.576 (see Appendix), so this is better treated as a sensitivity check than a strict robustness check — differences in results reflect the conceptual gap between centroid-based and address-based distance rather than fragility of the finding.
+
+**B-r2 (Pop > 1000):** Results are almost identical to baseline — `prox_main` 0.049\*\*, `pct_single_hh` −0.004\*\*\*. If anything slightly stronger. The results are not driven by small, unreliable districts.
+
+**B-r3 (No big 4 cities):** Very stable — `prox_main` 0.053\*\*, `pct_single_hh` −0.003\*. Excluding Amsterdam, Rotterdam, Den Haag and Utrecht barely changes anything. The proximity discount and negative singles effect are not an urban big-city phenomenon.
+
+**B-dens (School density within 1km):** `n_schools_1km` is −0.021\*\*\* — negative and highly significant, directly replicating the proximity discount with the expected sign reversal (more schools nearby = lower WOZ). The interaction `n_schools_1km:pct_single_hh` is +0.0004\*\*\* — positive and significant, meaning the density discount weakens as singles share rises. This is actually stronger confirmation of H2 than the distance-based Model B itself, suggesting the density measure picks up the demographic moderating channel more cleanly. The correlation between `n_schools_1km` and `dist_primary_school` is −0.398 (see Appendix), confirming the two operationalisations capture related but meaningfully different aspects of proximity.
+
+**One honest note across all checks:** the `prox_main:pct_single_hh` interaction remains insignificant in B-r1 through B-r3. The singles interaction only becomes significant once car ownership is jointly modelled (Model H) or when school density is used instead of distance (B-dens).
+
+**Bottom line:** the two core Model B findings — proximity is a discount and higher singles share lowers WOZ — are robust across all four checks.
+
+```{r robustness-modelH}
+# ── Model H: car ownership interaction ────────────────────────────────────────
+# mH — main sample, CBS distance, pop > 500
+
+# H-rob1: centroid distance instead of CBS distance
+mH_rob1 <- feols(
+  log_woz ~ dist_school_centroid_km * pct_single_hh +
+            dist_school_centroid_km * cars_per_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            pct_owner_occupied + lbm_score | gemeente_code,
+  data = df,
+  vcov = ~gemeente_code
+)
+
+# H-rob2: pop > 1000
+mH_rob2 <- feols(
+  log_woz ~ prox_main * pct_single_hh +
+            prox_main * cars_per_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            pct_owner_occupied + lbm_score | gemeente_code,
+  data = df_pop1000,
+  vcov = ~gemeente_code
+)
+
+# H-rob3: exclude big 4 cities
+mH_rob3 <- feols(
+  log_woz ~ prox_main * pct_single_hh +
+            prox_main * cars_per_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            pct_owner_occupied + lbm_score | gemeente_code,
+  data = df_nobig4,
+  vcov = ~gemeente_code
+)
+
+# H-dens: school density within 1km (alternative proximity operationalisation)
+mH_dens <- feols(
+  log_woz ~ n_schools_1km * pct_single_hh +
+            n_schools_1km * cars_per_hh +
+            income_avg_k + pct_employed + pop_density_km2 + pct_age_0_14 +
+            pct_owner_occupied + lbm_score | gemeente_code,
+  data = df,
+  vcov = ~gemeente_code
+)
+
+etable(mH, mH_rob1, mH_rob2, mH_rob3, mH_dens,
+       headers     = list("(H) Baseline"       = 1,
+                          "(H-r1) Centroid"    = 1,
+                          "(H-r2) Pop > 1000"  = 1,
+                          "(H-r3) No big 4"    = 1,
+                          "(H-dens) Density"   = 1),
+       keep        = c("prox_main", "dist_school_centroid_km", "n_schools_1km",
+                       "pct_single_hh",
+                       "prox_main:pct_single_hh",
+                       "dist_school_centroid_km:pct_single_hh",
+                       "n_schools_1km:pct_single_hh",
+                       "cars_per_hh",
+                       "prox_main:cars_per_hh",
+                       "dist_school_centroid_km:cars_per_hh",
+                       "n_schools_1km:cars_per_hh"),
+       signif.code = c("***" = 0.001, "**" = 0.01, "*" = 0.05),
+       notes       = "Municipality FE, SEs clustered at gemeente level. Key coefficients only. H-dens uses school count within 1km — sign reversal expected.")
+```
+
+Model H robustness gives a mixed but informative picture across four checks:
+
+**H-r1 (Centroid distance — sensitivity check):** Both interactions lose significance — `dist_school_centroid_km:cars_per_hh` is +0.009 (wrong sign, not significant). The centroid-based measure does not replicate Model H's findings. As with B-r1, this reflects the conceptual difference between the two distance measures (r = 0.576) rather than pure fragility — the CBS address-based distance is the theoretically superior measure for capturing the residential experience of households.
+
+**H-r2 (Pop > 1000):** `prox_main` stays positive and significant (0.157\*), `prox_main:cars_per_hh` drops to −0.059 (p ≈ 0.10, marginally insignificant). The singles interaction also weakens. The stricter population filter reduces the sample by ~308 districts and precision drops — the direction is consistent but significance is lost.
+
+**H-r3 (No big 4 cities):** The strongest confirmation. `prox_main` 0.230\*\*\*, `prox_main:cars_per_hh` −0.094\*\*\*, `prox_main:pct_single_hh` −0.002\*\*\* — all three key coefficients match the baseline almost exactly. The four largest cities are not driving Model H's findings.
+
+**H-dens (School density within 1km):** `n_schools_1km:cars_per_hh` is −0.023\*\*\* — significant, but the direction implies a different mechanism than Model H. In the density model, a negative density×cars coefficient means the school density discount is *larger* in high-car districts, suggesting car-driving households are more sensitive to the congestion and noise of multiple nearby schools. This is distinct from the distance-based finding (where car ownership weakens the discount) and reflects a genuine conceptual difference between density and distance as proximity measures — they are not interchangeable robustness checks for Model H.
+
+**Overall verdict:** Model H is **partially robust**. The car ownership interaction survives the big-city exclusion (H-r3) and shows a consistent direction in the density check (H-dens), but is sensitive to the distance operationalisation and weakens under stricter population restrictions. This partial robustness should be reported honestly — the finding is credible but not universal across all specifications.
+
+```{r robustness-tipping-points-singles}
+# Singles tipping point (pct_single_hh*) across Model H robustness checks
+# Formula: singles* = (-β1 - β3_cars * cars_mean) / β3_singles
+# Evaluated at mean cars_per_hh of the respective sample
+
+rob_models_H <- list(
+  "H baseline"    = list(mod = mH,      dv = "prox_main",               data = df),
+  "H-r1 Centroid" = list(mod = mH_rob1, dv = "dist_school_centroid_km", data = df),
+  "H-r2 Pop>1000" = list(mod = mH_rob2, dv = "prox_main",               data = df_pop1000),
+  "H-r3 No big 4" = list(mod = mH_rob3, dv = "prox_main",               data = df_nobig4)
+)
+
+singles_tp_results <- lapply(names(rob_models_H), function(nm) {
+  m      <- rob_models_H[[nm]]$mod
+  dv     <- rob_models_H[[nm]]$dv
+  d      <- rob_models_H[[nm]]$data
+  c_mean <- mean(d$cars_per_hh, na.rm = TRUE)
+
+  b1      <- tryCatch(coef(m)[dv],                              error = function(e) NA)
+  b3_sing <- tryCatch(coef(m)[paste0(dv, ":pct_single_hh")],   error = function(e) NA)
+  b3_cars <- tryCatch(coef(m)[paste0(dv, ":cars_per_hh")],     error = function(e) NA)
+
+  if (any(is.na(c(b1, b3_sing, b3_cars))) || b3_sing == 0)
+    return(data.frame(spec = nm, tp = NA, lower = NA, upper = NA,
+                      cars_mean = round(c_mean, 3), in_range = NA))
+
+  tp <- (-b1 - b3_cars * c_mean) / b3_sing
+
+  # Delta-method SE w.r.t. [β1, β3_singles, β3_cars]
+  v    <- vcov(m)[c(dv, paste0(dv, ":pct_single_hh"), paste0(dv, ":cars_per_hh")),
+                   c(dv, paste0(dv, ":pct_single_hh"), paste0(dv, ":cars_per_hh"))]
+  grad <- c(-1/b3_sing,
+            (b1 + b3_cars * c_mean) / b3_sing^2,
+            -c_mean / b3_sing)
+  se   <- sqrt(as.numeric(t(grad) %*% v %*% grad))
+  ci   <- tp + c(-1.96, 1.96) * se
+
+  data.frame(spec      = nm,
+             tp        = round(tp, 1),
+             lower     = round(ci[1], 1),
+             upper     = round(ci[2], 1),
+             cars_mean = round(c_mean, 3),
+             in_range  = tp > 0 & tp < 100)
+})
+
+singles_tp_df <- do.call(rbind, singles_tp_results)
+
+cat("Singles tipping point (pct_single_hh*) across Model H robustness checks:\n\n")
+print(singles_tp_df, row.names = FALSE)
+cat("\nSample 95th pct singles:", round(quantile(df$pct_single_hh, 0.95, na.rm = TRUE), 1), "%\n")
+cat("Sample max singles:     ", round(max(df$pct_single_hh, na.rm = TRUE), 1), "%\n")
+```
+
+The table demonstrates:
+
+**H baseline: 60.9% [41.0, 80.7]** — the main result, tight CI entirely within 0–100%, `in_range = TRUE`. 
+
+**H-r1 Centroid: 74.5% [−55.5, 204.5]** — the point estimate is within range but the CI is enormous and crosses both 0 and 100. This reflects that the underlying interactions are not significant with centroid distance — the tipping point exists in the formula but is not statistically credible. Discard.
+
+**H-r2 Pop > 1000: 93.7% [−13.3, 200.7]** — point estimate shifts to 93.7% but with a very wide CI that crosses zero. Again, the weaker significance of the interactions in the restricted sample makes the tipping point imprecise. Directionally consistent but not significant.
+
+**H-r3 No big 4: 56.8% [40.3, 73.3]** — almost identical to baseline, tight CI, entirely within range. The best robustness confirmation — excluding the four largest cities gives 56.8% vs 60.9%, overlapping CIs, both precise. 
+
+**The honest summary for the thesis:**
+
+The singles tipping point is **robust only in the no-big-4 check** (56.8%, CI [40.3, 73.3]). The pop > 1000 and centroid checks produce wide CIs due to weaker underlying interactions. Combined with H-r3, you can credibly say:
+
+*"The conditional singles tipping point of ~61% is stable when excluding the four largest cities (56.8%, CI [40.3, 73.3]) but becomes imprecise under stricter population restrictions and alternative distance measures, reflecting the partial robustness of the car ownership interaction documented in Table A6."*
+
+This is an honest and defensible conclusion — the finding is real but not universal across all specifications.
+
+```{r robustness-tipping-points-cars}
+# Conditional tipping points (cars_per_hh*) for Model H robustness variants
+# Formula: cars* = (-β1 - β3_singles*s̄) / β3_cars  — consistent with Table A6
+# Each variant uses the mean singles share of its own sample
+
+rob_models_cars <- list(
+  "H baseline"    = list(mod = mH,      dv = "prox_main",               data = df),
+  "H-r1 Centroid" = list(mod = mH_rob1, dv = "dist_school_centroid_km", data = df),
+  "H-r2 Pop>1000" = list(mod = mH_rob2, dv = "prox_main",               data = df_pop1000),
+  "H-r3 No big 4" = list(mod = mH_rob3, dv = "prox_main",               data = df_nobig4)
+)
+
+rob_tp <- lapply(names(rob_models_cars), function(nm) {
+  m      <- rob_models_cars[[nm]]$mod
+  dv     <- rob_models_cars[[nm]]$dv
+  d      <- rob_models_cars[[nm]]$data
+  s_mean <- mean(d$pct_single_hh, na.rm = TRUE)
+
+  b1      <- tryCatch(coef(m)[dv],                              error = function(e) NA)
+  b3_sing <- tryCatch(coef(m)[paste0(dv, ":pct_single_hh")],   error = function(e) NA)
+  b3_cars <- tryCatch(coef(m)[paste0(dv, ":cars_per_hh")],     error = function(e) NA)
+
+  if (any(is.na(c(b1, b3_sing, b3_cars))) || b3_cars == 0)
+    return(c(tp = NA, lower = NA, upper = NA))
+
+  tp <- (-b1 - b3_sing * s_mean) / b3_cars
+
+  # Delta-method SE w.r.t. [β1, β3_singles, β3_cars]
+  v    <- vcov(m)[c(dv, paste0(dv, ":pct_single_hh"), paste0(dv, ":cars_per_hh")),
+                  c(dv, paste0(dv, ":pct_single_hh"), paste0(dv, ":cars_per_hh"))]
+  grad <- c(-1/b3_cars, -s_mean/b3_cars, (b1 + b3_sing * s_mean)/b3_cars^2)
+  se   <- sqrt(as.numeric(t(grad) %*% v %*% grad))
+  c(tp = round(tp, 3), lower = round(tp - 1.96*se, 3), upper = round(tp + 1.96*se, 3))
+})
+
+cat("Cars tipping point (cars_per_hh*, conditional on mean singles) across Model H robustness checks:\n\n")
+tp_summary <- do.call(rbind, rob_tp)
+rownames(tp_summary) <- names(rob_models_cars)
+print(tp_summary)
+cat("\nSample max cars_per_hh:", round(max(df$cars_per_hh, na.rm = TRUE), 3), "\n")
+```
+
+Very informative — and consistent with what we saw in the model table. All values are now the conditional tipping point (at mean singles of the respective sample), matching the formula used in Table A6.
+
+**H baseline: 1.716 [1.503, 1.930]** — the main result, matching the value reported in the `cars-tipping-point` chunk. Tight CI, entirely within the data range (sample max 2.40).
+
+**H-r1 Centroid: −0.419 [−8.285, 7.447]** — meaningless. The negative point estimate and enormous CI confirm the underlying interactions are not identified with centroid distance. Discard.
+
+**H-r2 Pop > 1000: 2.089 [1.003, 3.174]** — shifts upward to 2.09, CI widens as expected with fewer observations, but the lower bound (1.003) is within the data range. Directionally consistent, less precise.
+
+**H-r3 No big 4: 1.718 [1.515, 1.921]** — virtually identical to the baseline (1.716 vs 1.718), with essentially the same CI. The strongest confirmation — removing the four largest cities changes nothing.
+
+**The honest thesis summary of all robustness:**
+
+The conditional cars tipping point is **stable at ~1.72–2.09 cars/HH** across the two meaningful checks (pop > 1000 and no big 4), with overlapping confidence intervals. It is not identified when using the centroid distance measure. The finding is robust to sample composition but tied to the CBS distance operationalisation — which should be acknowledged as a limitation.
+
+A clean one-sentence thesis statement: *"The conditional car ownership tipping point of 1.716 cars per household is stable across sample restrictions (2.089 with pop > 1000; 1.718 excluding the four largest cities) but cannot be identified using the centroid-based distance measure, suggesting sensitivity to the proximity operationalisation."*
+
+Note: the school density check (B-dens, H-dens) is not included in the tipping point stability analysis. The density model replaces distance with school count, reversing the sign of the main effect and changing what the interaction term captures — a tipping point derived from `mH_dens` would not be directly comparable to the 1.716 cars/HH and 60.9% singles estimates from the distance-based Model H, and including it would conflate two different mechanisms rather than providing a genuine stability check.
+
+```{r robustness-tables}
+# ── Shared coefficient map for robustness tables ──────────────────────────────
+rob_coef_B <- c(
+  "prox_main"                             = "Distance to school (km)",
+  "dist_school_centroid_km"               = "Distance to school (km, centroid)",
+  "n_schools_1km"                         = "Schools within 1 km",
+  "pct_single_hh"                         = "Single-HH share (%)",
+  "prox_main:pct_single_hh"               = "Distance × Single-HH share",
+  "dist_school_centroid_km:pct_single_hh" = "Distance × Single-HH share",
+  "n_schools_1km:pct_single_hh"           = "Schools × Single-HH share",
+  "income_avg_k"                          = "Avg. household income (k€)",
+  "pct_employed"                          = "Employment rate (%)",
+  "pop_density_km2"                       = "Population density (per km²)",
+  "pct_age_0_14"                          = "Share aged 0–14 (%)",
+  "pct_owner_occupied"                    = "Owner-occupied (%)",
+  "lbm_score"                             = "Liveability score"
+)
+
+rob_coef_H <- c(
+  rob_coef_B,
+  "cars_per_hh"                           = "Cars per household",
+  "prox_main:cars_per_hh"                 = "Distance × Cars/HH",
+  "dist_school_centroid_km:cars_per_hh"   = "Distance × Cars/HH (centroid)",
+  "n_schools_1km:cars_per_hh"             = "Schools × Cars/HH"
+)
+
+rob_gof <- data.frame(
+  raw   = c("nobs",         "adj.r.squared"),
+  clean = c("Observations", "Adj. R²"),
+  fmt   = c(0,              3),
+  stringsAsFactors = FALSE
+)
+
+# ── Table A4: Robustness checks — Model B ─────────────────────────────────────
+tbl_rob_B <- modelsummary(
+  models   = list("(B) Baseline"      = mB,
+                  "(B-r1) Centroid"   = mB_rob1,
+                  "(B-r2) Pop > 1000" = mB_rob2,
+                  "(B-r3) No big 4"   = mB_rob3,
+                  "(B-dens) Density"  = mB_dens),
+  coef_map = rob_coef_B,
+  gof_map  = rob_gof,
+  stars    = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  fmt      = 3,
+  escape   = FALSE,
+  output   = "kableExtra",
+  title    = "Table A4. Robustness checks — Model B (cross-sectional baseline)"
+) %>%
+  add_footnote(
+    label    = "Municipality FE, SEs clustered at gemeente level throughout. B-r1: centroid-based distance (sensitivity check). B-r2: minimum population threshold raised to 1,000. B-r3: excludes Amsterdam, Rotterdam, Den Haag, and Utrecht. B-dens: proximity operationalised as school count within 1 km (sign reversal expected). * p < 0.05, ** p < 0.01, *** p < 0.001.",
+    notation = "none"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "condensed"),
+    full_width        = FALSE,
+    font_size         = 13,
+    html_font         = "Times New Roman, Times, serif"
+  )
+
+tbl_rob_B %>% save_kable("output/tables/robustness_B_table.html", self_contained = TRUE)
+webshot2::webshot("output/tables/robustness_B_table.html",
+                  "output/figures/robustness_B_table.png", zoom = 2)
+
+# ── Table A5: Robustness checks — Model H ─────────────────────────────────────
+tbl_rob_H <- modelsummary(
+  models   = list("(H) Baseline"      = mH,
+                  "(H-r1) Centroid"   = mH_rob1,
+                  "(H-r2) Pop > 1000" = mH_rob2,
+                  "(H-r3) No big 4"   = mH_rob3,
+                  "(H-dens) Density"  = mH_dens),
+  coef_map = rob_coef_H,
+  gof_map  = rob_gof,
+  stars    = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  fmt      = 3,
+  escape   = FALSE,
+  output   = "kableExtra",
+  title    = "Table A5. Robustness checks — Model H (car ownership interaction)"
+) %>%
+  add_footnote(
+    label    = "Municipality FE, SEs clustered at gemeente level throughout. H-r1: centroid-based distance (sensitivity check). H-r2: minimum population threshold raised to 1,000. H-r3: excludes Amsterdam, Rotterdam, Den Haag, and Utrecht. H-dens: proximity operationalised as school count within 1 km (sign reversal expected). * p < 0.05, ** p < 0.01, *** p < 0.001.",
+    notation = "none"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "condensed"),
+    full_width        = FALSE,
+    font_size         = 13,
+    html_font         = "Times New Roman, Times, serif"
+  )
+
+tbl_rob_H %>% save_kable("output/tables/robustness_H_table.html", self_contained = TRUE)
+webshot2::webshot("output/tables/robustness_H_table.html",
+                  "output/figures/robustness_H_table.png", zoom = 2)
+```
+
+```{r tipping-point-table}
+# ── Table A6: Implied tipping points across robustness specifications ──────────
+# Helper: format tp + CI as "X.X% [lo, hi]" or "—" if NA / not identified
+fmt_tp <- function(tp, lo, hi, pct = FALSE) {
+  if (is.na(tp)) return("&mdash;")
+  sfx <- if (pct) "%" else ""
+  sprintf("%.1f%s [%.1f, %.1f]", tp, sfx, lo, hi)
+}
+
+# ── Model B: singles tipping point only (no cars interaction) ─────────────────
+b_specs <- list(
+  "(B) Baseline"    = list(mod = mB,      dv = "prox_main"),
+  "(B-r1) Centroid" = list(mod = mB_rob1, dv = "dist_school_centroid_km"),
+  "(B-r2) Pop>1000" = list(mod = mB_rob2, dv = "prox_main"),
+  "(B-r3) No big 4" = list(mod = mB_rob3, dv = "prox_main")
+)
+
+b_tp_rows <- lapply(names(b_specs), function(nm) {
+  m       <- b_specs[[nm]]$mod
+  dv      <- b_specs[[nm]]$dv
+  b1      <- tryCatch(coef(m)[dv],                            error = function(e) NA)
+  b3_sing <- tryCatch(coef(m)[paste0(dv, ":pct_single_hh")], error = function(e) NA)
+  if (any(is.na(c(b1, b3_sing))) || b3_sing == 0)
+    return(data.frame(spec = nm, singles_fmt = "&mdash;", cars_fmt = "&mdash;",
+                      stringsAsFactors = FALSE))
+  tp   <- -b1 / b3_sing
+  v    <- vcov(m)[c(dv, paste0(dv, ":pct_single_hh")),
+                  c(dv, paste0(dv, ":pct_single_hh"))]
+  grad <- c(-1/b3_sing, b1/b3_sing^2)
+  se   <- sqrt(as.numeric(t(grad) %*% v %*% grad))
+  ci   <- tp + c(-1.96, 1.96) * se
+  data.frame(spec       = nm,
+             singles_fmt = fmt_tp(tp, ci[1], ci[2], pct = TRUE),
+             cars_fmt    = "&mdash;",
+             stringsAsFactors = FALSE)
+})
+b_tp <- do.call(rbind, b_tp_rows)
+
+# ── Model H: singles tipping point (from earlier chunk) + cars recomputed ─────
+h_specs_list <- list(
+  "(H) Baseline"    = list(mod = mH,      dv = "prox_main",               data = df),
+  "(H-r1) Centroid" = list(mod = mH_rob1, dv = "dist_school_centroid_km", data = df),
+  "(H-r2) Pop>1000" = list(mod = mH_rob2, dv = "prox_main",               data = df_pop1000),
+  "(H-r3) No big 4" = list(mod = mH_rob3, dv = "prox_main",               data = df_nobig4)
+)
+
+h_tp_rows <- lapply(names(h_specs_list), function(nm) {
+  m        <- h_specs_list[[nm]]$mod
+  dv       <- h_specs_list[[nm]]$dv
+  d        <- h_specs_list[[nm]]$data
+  c_mean   <- mean(d$cars_per_hh,   na.rm = TRUE)
+  s_mean   <- mean(d$pct_single_hh, na.rm = TRUE)
+
+  b1      <- tryCatch(coef(m)[dv],                                    error = function(e) NA)
+  b3_sing <- tryCatch(coef(m)[paste0(dv, ":pct_single_hh")],         error = function(e) NA)
+  b3_cars <- tryCatch(coef(m)[paste0(dv, ":cars_per_hh")],           error = function(e) NA)
+
+  # Singles tipping point at mean cars
+  sing_fmt <- tryCatch({
+    if (any(is.na(c(b1, b3_sing, b3_cars))) || b3_sing == 0) return("&mdash;")
+    tp   <- (-b1 - b3_cars * c_mean) / b3_sing
+    v    <- vcov(m)[c(dv, paste0(dv, ":pct_single_hh"), paste0(dv, ":cars_per_hh")),
+                    c(dv, paste0(dv, ":pct_single_hh"), paste0(dv, ":cars_per_hh"))]
+    grad <- c(-1/b3_sing, (b1 + b3_cars*c_mean)/b3_sing^2, -c_mean/b3_sing)
+    se   <- sqrt(as.numeric(t(grad) %*% v %*% grad))
+    ci   <- tp + c(-1.96, 1.96) * se
+    fmt_tp(tp, ci[1], ci[2], pct = TRUE)
+  }, error = function(e) "&mdash;")
+
+  # Cars tipping point at mean singles
+  cars_fmt <- tryCatch({
+    if (any(is.na(c(b1, b3_sing, b3_cars))) || b3_cars == 0) return("&mdash;")
+    tp   <- (-b1 - b3_sing * s_mean) / b3_cars
+    v    <- vcov(m)[c(dv, paste0(dv, ":pct_single_hh"), paste0(dv, ":cars_per_hh")),
+                    c(dv, paste0(dv, ":pct_single_hh"), paste0(dv, ":cars_per_hh"))]
+    grad <- c(-1/b3_cars, -s_mean/b3_cars, (b1 + b3_sing*s_mean)/b3_cars^2)
+    se   <- sqrt(as.numeric(t(grad) %*% v %*% grad))
+    ci   <- tp + c(-1.96, 1.96) * se
+    fmt_tp(tp, ci[1], ci[2], pct = FALSE)
+  }, error = function(e) "&mdash;")
+
+  data.frame(spec = nm, singles_fmt = sing_fmt, cars_fmt = cars_fmt,
+             stringsAsFactors = FALSE)
+})
+h_tp <- do.call(rbind, h_tp_rows)
+
+# ── Combine and render ────────────────────────────────────────────────────────
+tp_combined        <- rbind(b_tp, h_tp)
+colnames(tp_combined) <- c("Specification",
+                            "Singles tipping point [95% CI]",
+                            "Cars/HH tipping point [95% CI]")
+
+tbl_tp <- knitr::kable(
+  tp_combined,
+  format  = "html",
+  caption = "Table A6. Implied tipping points across robustness specifications",
+  align   = c("l", "c", "c"),
+  escape  = FALSE
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "condensed"),
+    full_width        = FALSE,
+    font_size         = 13,
+    html_font         = "Times New Roman, Times, serif"
+  ) %>%
+  pack_rows("Model B — cross-sectional baseline (no car interaction)", 1, 4) %>%
+  pack_rows("Model H — car ownership interaction", 5, 8) %>%
+  add_footnote(
+    label    = "Singles tipping point: single-HH share (%) at which the marginal distance effect equals zero, evaluated at the sample mean of cars per household. Cars tipping point: cars per household at which the marginal distance effect equals zero. '—' indicates no interaction term present. 95% CIs computed via the delta method. Density variants (B-dens, H-dens) excluded as the school-count operationalisation reverses the sign of the proximity effect, making tipping points non-comparable. * p < 0.05, ** p < 0.01, *** p < 0.001.",
+    notation = "none"
+  )
+
+tbl_tp %>% save_kable("output/tables/tipping_point_table.html", self_contained = TRUE)
+webshot2::webshot("output/tables/tipping_point_table.html",
+                  "output/figures/tipping_point_table.png", zoom = 2)
+```
+
+---
+
+# Appendix
+
+## Proximity Measure Validation
+
+Before relying on `dist_primary_school` (CBS) as the main proximity variable, it is worth verifying how closely it aligns with `dist_school_centroid_km` (our own centroid-based measure computed from DUO coordinates). A strong correlation between the two confirms that the CBS-reported distances are well-behaved and that our spatial join is consistent with the official data. A weak correlation would signal measurement differences worth investigating.
+
+```{r proximity-measure-correlation, fig.cap="Correlation between CBS-reported distance and centroid-based distance to nearest primary school."}
+# ── Compute correlation ───────────────────────────────────────────────────────
+cor_val <- cor(df$dist_primary_school, df$dist_school_centroid_km,
+               use = "complete.obs")
+n_both  <- sum(!is.na(df$dist_primary_school) & !is.na(df$dist_school_centroid_km))
+
+cat("Pearson correlation: r =", round(cor_val, 3), "\n")
+cat("N (both measures available):", n_both, "\n")
+cat("Mean CBS distance:      ", round(mean(df$dist_primary_school,      na.rm = TRUE), 3), "km\n")
+cat("Mean centroid distance: ", round(mean(df$dist_school_centroid_km,  na.rm = TRUE), 3), "km\n")
+
+# ── Scatter plot ──────────────────────────────────────────────────────────────
+ggplot(df, aes(x = dist_primary_school, y = dist_school_centroid_km)) +
+  geom_point(alpha = 0.25, size = 0.8, colour = "#2E5D9E") +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", colour = "grey40", linewidth = 0.8) +
+  geom_smooth(method = "lm", colour = "#E07B39", se = FALSE, linewidth = 1) +
+  annotate("text", x = 0.5, y = max(df$dist_school_centroid_km, na.rm = TRUE) * 0.9,
+           label = paste0("r = ", round(cor_val, 3)),
+           size = 4.5, colour = "#2E5D9E") +
+  labs(
+    title    = "CBS distance vs centroid-based distance to nearest primary school",
+    subtitle = "Dashed line = perfect agreement (slope 1, intercept 0) | Orange = OLS fit",
+    x        = "CBS average distance to school (km)",
+    y        = "Centroid-to-nearest-school distance (km)"
+  )
+
+ggsave("output/figures/proximity_measure_correlation.png", width = 9, height = 5.5, dpi = 150)
+```
+
+r = 0.576 is lower than ideal — this deserves careful interpretation. Several factors explain it:
+
+**1. Fundamentally different measurement concepts**
+The CBS measure (`dist_primary_school`) is the **average distance from all residential addresses** in the wijk to their nearest school. The centroid measure (`dist_school_centroid_km`) is the distance from the **geometric centre of the wijk polygon** to the nearest school. These are conceptually different things. In a wijk where residents cluster near one edge (e.g. along a river or motorway), the centroid can be very far from where most people actually live, creating large discrepancies.
+
+**2. The vertical striping you see in the plot**
+The CBS values are rounded to one decimal place (0.3, 0.4, 0.5 km...), which creates the vertical stripes. For each CBS value, the centroid measure varies widely — some wijken with CBS distance 0.5 km have centroid distances anywhere from 0 to 3+ km. This inflates scatter and depresses correlation.
+
+**3. Mean CBS (0.913 km) > Mean centroid (0.796 km)**
+The OLS line sitting below the 45° dashed line confirms this systematic difference. CBS averages across all addresses, many of which are on the outskirts of the wijk and therefore further from schools. The centroid is a single central point which tends to be closer to schools than the average residential address in spread-out wijken.
+
+**4. Large wijken cause the most divergence**
+Rural and suburban wijken are both geographically large and irregularly shaped — their centroids can be far from the population concentration, causing the largest discrepancies visible in the upper-left area of the plot.
+
+**What this means for the thesis:**
+
+r = 0.576 is actually a reasonable finding that you should report honestly. The two measures capture related but distinct aspects of proximity. This explains why the robustness check with centroid distance (H-r1) gave different results from the CBS-based models — the two variables are not interchangeable, and the CBS measure is theoretically superior for this analysis because it reflects the actual residential experience of households in the wijk rather than an arbitrary geometric point.
+
+In the thesis you can write: *"The CBS-reported average distance and the centroid-based distance are moderately correlated (r = 0.576), reflecting that the two operationalisations capture related but distinct aspects of school proximity. The CBS measure is preferred as it is based on actual residential addresses rather than the geometric centroid of the district polygon, which may fall far from the population concentration in large or irregularly shaped wijken."*
+
+## Correlation Between Distance and Density Proximity Measures
+
+The robustness check using `n_schools_1km` (school density within 1 km) as an alternative proximity operationalisation rests on the assumption that the two measures — distance to nearest school and number of schools nearby — are related but not identical. A high positive correlation would make the density check redundant; a very low correlation would raise concerns about whether they measure the same underlying concept at all. The correlation below quantifies this relationship and informs how to interpret the density robustness results.
+
+```{r correlation-of-n_schools_1km-and-dist_primary_school}
+cat("Correlation between n_schools_1km and dist_primary_school:\n")
+cat("r =", round(cor(df$n_schools_1km, df$dist_primary_school, use = "complete.obs"), 3), "\n")
+cat("\nNote: negative correlation expected — more schools nearby = shorter distance to nearest school.")
+```
+
+The correlation is negative as expected (more schools within 1 km → shorter distance to the nearest school) but only moderate in magnitude (r ≈ −0.40). This confirms that the two operationalisations overlap partially but capture meaningfully different aspects of school proximity: distance captures how far the nearest school is, while density captures how many schools are within walking distance. The moderate correlation justifies including the density check as a genuine alternative perspective — it is neither redundant (too correlated) nor disconnected (too different).
+
